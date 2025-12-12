@@ -10,11 +10,12 @@ import os
 import random
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import Counter, defaultdict
 from urllib.parse import urlencode, quote
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
 
 load_dotenv()
 
@@ -58,8 +59,8 @@ TIMEOUT_SECONDS = 10.0
 
 class WeeklyReportRequest(BaseModel):
     user_id: str
-    start_date: str  # Format: YYYY-MM-DD
-    end_date: str  # Format: YYYY-MM-DD
+    start_date: str  # Format: YYYY-MM-DD (in user's local timezone)
+    end_date: str  # Format: YYYY-MM-DD (in user's local timezone)
 
 # ==========================================
 # AUTHENTICATION
@@ -87,6 +88,55 @@ def verify_token(authorization: str = Header(None)):
         raise HTTPException(status_code=401, detail="Invalid Authorization header format")
 
 # ==========================================
+# TIMEZONE CONVERSION FUNCTIONS
+# ==========================================
+
+async def fetch_user_timezone(user_id: str) -> str:
+    """Fetch user's timezone from their profile."""
+    url = f"{API_BASE}/user-profile/foodhak-user-id/{user_id}/"
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
+            response = await client.get(url, headers=HEADERS)
+            response.raise_for_status()
+            data = response.json()
+            
+        user_block = data.get("foodhak_user", {})
+        tz = user_block.get("timezone", "UTC")
+        logger.info(f"✅ Fetched timezone for user {user_id}: {tz}")
+        return tz
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to fetch timezone for user {user_id}, defaulting to UTC: {e}")
+        return "UTC"
+
+def convert_local_date_to_utc_window(local_date_str: str, user_tz: str) -> tuple:
+    """
+    Convert a local date (YYYY-MM-DD) to UTC start/end timestamps.
+    Returns: Tuple of (start_utc_iso, end_utc_iso) in ISO format with Z suffix
+    """
+    try:
+        local_day = datetime.strptime(local_date_str, "%Y-%m-%d").date()
+    except ValueError as e:
+        logger.error(f"❌ Invalid date format: {local_date_str}")
+        raise ValueError(f"Date must be in YYYY-MM-DD format: {e}")
+    
+    tz = ZoneInfo(user_tz)
+    
+    # Create datetime at start of day in user's timezone
+    local_start = datetime(local_day.year, local_day.month, local_day.day, 0, 0, 0, tzinfo=tz)
+    local_end = local_start + timedelta(days=1)
+    
+    # Convert to UTC
+    start_utc = local_start.astimezone(timezone.utc)
+    end_utc = local_end.astimezone(timezone.utc)
+    
+    # Format as ISO strings with Z suffix
+    start_utc_str = start_utc.isoformat().replace("+00:00", "Z")
+    end_utc_str = end_utc.isoformat().replace("+00:00", "Z")
+    
+    logger.debug(f"📅 Converted {local_date_str} ({user_tz}) -> UTC: {start_utc_str} to {end_utc_str}")
+    return start_utc_str, end_utc_str
+
+# ==========================================
 # 2. SHARED FETCHERS (ASYNC)
 # ==========================================
 
@@ -110,10 +160,6 @@ async def fetch_json(url, params=None, manual_query_string=None):
             
         response.raise_for_status()
         data = response.json()
-        
-        # Log data size for context
-        item_count = len(data) if isinstance(data, list) else len(data.get("results", [])) if "results" in data else 1
-        logger.debug(f"✅ Success: {full_url} ({duration}ms) | Items: {item_count}")
         return data
         
     except httpx.HTTPStatusError as e:
@@ -124,7 +170,6 @@ async def fetch_json(url, params=None, manual_query_string=None):
         return None
 
 async def fetch_primary_goal(user_id):
-    """Queries OpenSearch for the user's primary goal."""
     logger.info(f"🎯 Fetching primary goal for user: {user_id}")
     query = {"query": {"match": {"foodhak_user_id": user_id}}}
     try:
@@ -132,12 +177,10 @@ async def fetch_primary_goal(user_id):
             response = await client.post(OPENSEARCH_URL, json=query, auth=OPENSEARCH_AUTH)
             
         if response.status_code != 200:
-            logger.warning(f"⚠️ OpenSearch status {response.status_code}, defaulting to 'Weight Loss'")
             return "Weight Loss"
 
         hits = response.json().get("hits", {}).get("hits", [])
         if not hits: 
-            logger.warning("⚠️ No OpenSearch profile found, defaulting to 'Weight Loss'")
             return "Weight Loss"
 
         source = hits[0].get("_source", {})
@@ -145,27 +188,25 @@ async def fetch_primary_goal(user_id):
 
         primary = next((g for g in goals if g.get("user_goal", {}).get("is_primary")), None)
         if primary: 
-            goal = primary["user_goal"].get("title")
-            logger.info(f"✅ Found primary goal: {goal}")
-            return goal
+            return primary["user_goal"].get("title")
         
         if goals: 
-            goal = goals[0]["user_goal"].get("title")
-            logger.info(f"✅ Found secondary goal (fallback): {goal}")
-            return goal
+            return goals[0]["user_goal"].get("title")
 
-        logger.warning("⚠️ User has profile but no goals, defaulting to 'Weight Loss'")
         return "Weight Loss"
     except Exception as e:
         logger.error(f"❌ Error fetching primary goal: {e}, defaulting to 'Weight Loss'")
         return "Weight Loss"
 
-async def fetch_active_days(user_id, start_date, end_date):
+async def fetch_active_days(user_id, start_date_utc, end_date_utc, user_tz):
+    """
+    Fetch active days using UTC ISO timestamps, but return LOCAL date strings.
+    """
     url = f"{API_BASE}/user-insight-messages/date-range"
     params = {
         "user_id": user_id,
-        "startdate": f"{start_date}T00:00:00Z",
-        "enddate": f"{end_date}T23:59:59Z"
+        "startdate": start_date_utc,
+        "enddate": end_date_utc
     }
     resp = await fetch_json(url, params=params)
     active_dates = set()
@@ -174,47 +215,51 @@ async def fetch_active_days(user_id, start_date, end_date):
     messages = resp if isinstance(resp, list) else resp.get("results", resp.get("data", []))
 
     for msg in messages:
-        raw_ts = msg.get("message_date")
+        raw_ts = msg.get("message_date") # e.g., 2025-01-01T23:30:00Z
         if raw_ts:
             try:
-                active_dates.add(raw_ts.split("T")[0])
-            except:
+                # 1. Parse UTC
+                utc_dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+                # 2. Convert to User TZ
+                local_dt = utc_dt.astimezone(ZoneInfo(user_tz))
+                # 3. Add Local Date
+                active_dates.add(local_dt.strftime("%Y-%m-%d"))
+            except Exception as e:
                 continue
     
-    logger.info(f"📅 Active Days Found: {len(active_dates)} ({sorted(list(active_dates))})")
+    logger.info(f"📅 Active Days Found (Local): {len(active_dates)} ({sorted(list(active_dates))})")
     return active_dates
 
-async def fetch_meals(user_id, start_date, end_date):
-    url = f"{API_BASE}/meal-planner/custom-meals/foodhak-user/{user_id}"
-    return await fetch_json(url, params={"start_date": start_date, "end_date": end_date})
+async def fetch_meals(user_id, start_date_utc, end_date_utc):
+    url = f"{API_BASE}/meal-planner/custom-meals/foodhak-user-id/{user_id}"
+    return await fetch_json(url, params={"start_date": start_date_utc, "end_date": end_date_utc})
 
 async def fetch_daily_target(user_id):
     url = f"{API_BASE}/user-healthprofile-group-details/{user_id}/nutrient-guidelines"
     data = await fetch_json(url)
     if not data or "results" not in data: 
-        logger.debug("ℹ️ No nutrient target found, defaulting to 2000 kcal")
         return 2000
     energy = data["results"].get("Energy", [])
     if energy: 
-        target = int(float(energy[0].get("target_value", 2000)))
-        logger.debug(f"ℹ️ Found daily calorie target: {target} kcal")
-        return target
+        return int(float(energy[0].get("target_value", 2000)))
     return 2000
 
-async def fetch_chats(user_id, start_date, end_date):
+async def fetch_chats(user_id, start_date_utc, end_date_utc):
     url = f"{API_BASE}/chathistory/latest-sessions/"
     resp = await fetch_json(url, params={"user_id": user_id, "limit": 100})
     if not resp: return []
 
     valid_chats = []
-    s_dt = datetime.strptime(start_date, "%Y-%m-%d")
-    e_dt = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+    
+    # Parse timestamps for comparison
+    s_dt = datetime.fromisoformat(start_date_utc.replace("Z", "+00:00"))
+    e_dt = datetime.fromisoformat(end_date_utc.replace("Z", "+00:00"))
 
     for session in resp:
         ts = session.get("timestamp")
         if not ts: continue
         try:
-            sess_dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).replace(tzinfo=None)
+            sess_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
             if s_dt <= sess_dt < e_dt:
                 history = json.loads(session.get("chat_history", "[]"))
                 for msg in history:
@@ -224,23 +269,23 @@ async def fetch_chats(user_id, start_date, end_date):
         except:
             continue
     
-    logger.info(f"💬 Found {len(valid_chats)} chat messages in date range")
     return valid_chats
 
-async def fetch_trackers(user_id, start_date, end_date):
+async def fetch_trackers(user_id, start_date_utc, end_date_utc):
     base_url = f"{API_BASE}/user-profile/{user_id}/tracker"
     types = ["WEIGHT", "STEPS", "SLEEP", "MOOD_ENTRY"]
     data = {}
+    
     for t in types:
-        inner_query = urlencode({"type": t, "start_date": start_date, "end_date": end_date})
-        encoded_query = quote(inner_query, safe="")
-        resp = await fetch_json(base_url, manual_query_string=encoded_query)
+        query_string = f"type={t}&start_datetime={start_date_utc}&end_datetime={end_date_utc}"
+        params = {"query": query_string}
+        resp = await fetch_json(base_url, params=params)
         data[t] = resp.get("results", resp.get("data", [])) if resp else []
     return data
 
-async def fetch_scans(user_id, start_date, end_date):
+async def fetch_scans(user_id, start_date_utc, end_date_utc):
     url = f"{API_BASE}/scans/by-user/"
-    params = {"foodhak_user_id": user_id, "startDate": start_date, "endDate": end_date}
+    params = {"foodhak_user_id": user_id, "startDate": start_date_utc, "endDate": end_date_utc}
     resp = await fetch_json(url, params=params)
     if isinstance(resp, list): return resp
     if isinstance(resp, dict): return resp.get("results", [])
@@ -283,17 +328,19 @@ def is_positive_change(delta, metric_type, goal):
 # 5. SECTION PROCESSORS (ASYNC)
 # ==========================================
 
-async def build_title_card(user_id, start_date, end_date, goal):
+async def build_title_card(user_id, start_date_utc, end_date_utc, goal, start_date_local, end_date_local, user_tz):
     logger.info("Building Title Card...")
-    active_dates = await fetch_active_days(user_id, start_date, end_date)
+    
+    # Pass user_tz to correctly identify active days
+    active_dates = await fetch_active_days(user_id, start_date_utc, end_date_utc, user_tz)
     
     days_map = {
         "sunday": False, "monday": False, "tuesday": False,
         "wednesday": False, "thursday": False, "friday": False, "saturday": False
     }
 
-    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    start_dt = datetime.strptime(start_date_local, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date_local, "%Y-%m-%d")
 
     if start_dt.month == end_dt.month:
         date_range = f"{start_dt.day}-{end_dt.day} {start_dt.strftime('%b')} {start_dt.year}"
@@ -316,49 +363,63 @@ async def build_title_card(user_id, start_date, end_date, goal):
         }
     }
 
-async def build_nutrition(user_id, start_date, end_date, primary_goal):
+async def build_nutrition(user_id, start_date_utc, end_date_utc, primary_goal, start_date_local, end_date_local, user_tz):
     logger.info(f"Building Nutrition Section (Goal: {primary_goal})")
     
-    dt_curr = datetime.strptime(start_date, "%Y-%m-%d")
-    prev_start = (dt_curr - timedelta(days=7)).strftime("%Y-%m-%d")
-    prev_end = (dt_curr - timedelta(days=1)).strftime("%Y-%m-%d")
+    # Calculate previous week dates in local timezone
+    dt_curr = datetime.strptime(start_date_local, "%Y-%m-%d")
+    prev_start_local = (dt_curr - timedelta(days=7)).strftime("%Y-%m-%d")
+    prev_end_local = (dt_curr - timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    # Convert previous week to UTC
+    prev_start_utc, _ = convert_local_date_to_utc_window(prev_start_local, user_tz)
+    _, prev_end_utc = convert_local_date_to_utc_window(prev_end_local, user_tz)
     
     logger.info("⚡ Parallel Fetch: Current Meals, Previous Meals, Target")
     curr_data, prev_data, target = await asyncio.gather(
-        fetch_meals(user_id, start_date, end_date),
-        fetch_meals(user_id, prev_start, prev_end),
+        fetch_meals(user_id, start_date_utc, end_date_utc),
+        fetch_meals(user_id, prev_start_utc, prev_end_utc),
         fetch_daily_target(user_id)
     )
 
-    def analyze(data, range_start_str, range_end_str, label=""):
-        # 1. Process logged data into a map (if data exists)
+    # -----------------------------------------------------
+    #Analyze Function now converts UTC -> Local
+    # -----------------------------------------------------
+    def analyze(data, range_start_str, range_end_str, timezone_str, label=""):
         daily_map = defaultdict(lambda: {"p": 0.0, "c": 0.0, "f": 0.0, "k": 0.0})
         
         if data and "results" in data:
             for item in data["results"]:
-                ts = item.get("timestamp")
+                ts = item.get("timestamp") # UTC Timestamp from DB
                 if ts:
-                    date_key = ts.split("T")[0]
-                    daily_map[date_key]["p"] += float(item.get("protein", 0))
-                    daily_map[date_key]["c"] += float(item.get("carbohydrates", 0))
-                    daily_map[date_key]["f"] += float(item.get("fat", 0))
-                    daily_map[date_key]["k"] += float(item.get("calories", 0))
+                    try:
+                        # 1. Parse UTC
+                        utc_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        # 2. Convert to User TZ
+                        local_dt = utc_dt.astimezone(ZoneInfo(timezone_str))
+                        # 3. Bucket into Local Day
+                        date_key = local_dt.strftime("%Y-%m-%d")
+                        
+                        daily_map[date_key]["p"] += float(item.get("protein", 0))
+                        daily_map[date_key]["c"] += float(item.get("carbohydrates", 0))
+                        daily_map[date_key]["f"] += float(item.get("fat", 0))
+                        daily_map[date_key]["k"] += float(item.get("calories", 0))
+                    except Exception as e:
+                        logger.warning(f"Date conversion error in meal: {e}")
+                        continue
 
-        # 2. Setup Loop Variables
         totals = {"p": 0, "c": 0, "f": 0, "k": 0}
-        logged_count = len(daily_map) # Count of days that actually have logs
+        logged_count = len(daily_map)
         daily_stats = []
         
         curr_d = datetime.strptime(range_start_str, "%Y-%m-%d")
         end_d = datetime.strptime(range_end_str, "%Y-%m-%d")
 
-        # 3. Iterate through EVERY day in the range (Start -> End)
         while curr_d <= end_d:
             d_str = curr_d.strftime("%Y-%m-%d")
             day_name = curr_d.strftime("%A")
 
             if d_str in daily_map:
-                # -- Logic for Logged Days --
                 stats = daily_map[d_str]
                 eaten = int(stats["k"])
                 
@@ -390,7 +451,6 @@ async def build_nutrition(user_id, start_date, end_date, primary_goal):
                     }
                 })
             else:
-                # -- Logic for Empty Days  --
                 daily_stats.append({
                     "day": day_name,
                     "is_logged": False,
@@ -401,22 +461,18 @@ async def build_nutrition(user_id, start_date, end_date, primary_goal):
 
             curr_d += timedelta(days=1)
 
-        # 4. Calculate Averages
         if logged_count > 0:
             avgs = {k: int(v/logged_count) for k, v in totals.items()}
         else:
             avgs = {"p": 0, "c": 0, "f": 0, "k": 0}
             
         logger.debug(f"ℹ️ {label} Analysis: {logged_count} days logged out of {len(daily_stats)} total days")
-        
-        # Always return the structure, even if logged_count is 0
         return {"avgs": avgs, "days": daily_stats, "count": logged_count}
 
-    # Use the new signature with date ranges
-    curr_res = analyze(curr_data, start_date, end_date, "CURRENT WEEK")
-    prev_res = analyze(prev_data, prev_start, prev_end, "PREVIOUS WEEK")
+    # Pass user_tz to the analyzer
+    curr_res = analyze(curr_data, start_date_local, end_date_local, user_tz, "CURRENT WEEK")
+    prev_res = analyze(prev_data, prev_start_local, prev_end_local, user_tz, "PREVIOUS WEEK")
     
-    # This ensures an empty chart is generated if the user has 0 logs.
     if not curr_res: 
         logger.warning("⚠️ Unexpected error in nutrition analysis")
         return None
@@ -425,8 +481,6 @@ async def build_nutrition(user_id, start_date, end_date, primary_goal):
     show_deltas = prev_day_count >= 1
     avg_curr = curr_res["avgs"]
     
-    logger.info(f"Nutrition Status: Current Logged={curr_res['count']} days. Deltas={'ON' if show_deltas else 'OFF'}")
-
     if show_deltas:
         avg_prev = prev_res["avgs"]
         deltas = {
@@ -452,8 +506,6 @@ async def build_nutrition(user_id, start_date, end_date, primary_goal):
     else:
         pct_p = pct_c = pct_f = 0
     
-    logger.debug(f"Macro Persona Kcal Distribution: P={pct_p}% C={pct_c}% F={pct_f}%")
-
     goal_lower = primary_goal.lower()
     is_loss_goal = "loss" in goal_lower or "lose" in goal_lower
     is_gain_goal = "gain" in goal_lower
@@ -471,7 +523,6 @@ async def build_nutrition(user_id, start_date, end_date, primary_goal):
     persona = None
     persona_title = "Balanced" 
 
-    # Note: If 0 logs, percentages are 0, which falls through to "Balanced week"
     if pct_f >= fat_threshold:
         persona_title = "Fat-heavy week"
         persona = {
@@ -508,8 +559,6 @@ async def build_nutrition(user_id, start_date, end_date, primary_goal):
             "logic_rule_applied": f"P {p_min}-{p_max}% | C {c_min}-{c_max}% | F {f_min}-{f_max}%"
         }
     
-    logger.info(f"🏷️ Assigned Persona: {persona_title}")
-
     response = {
         "summary": {
             "avg_daily_kcal": avg_curr["k"],
@@ -535,11 +584,10 @@ async def build_nutrition(user_id, start_date, end_date, primary_goal):
 
     return response
 
-async def build_faye(user_id, start_date, end_date):
+async def build_faye(user_id, start_date_utc, end_date_utc):
     logger.info("🏗️ Building Faye Insights...")
-    queries = await fetch_chats(user_id, start_date, end_date)
+    queries = await fetch_chats(user_id, start_date_utc, end_date_utc)
     if not queries:
-        logger.warning("⚠️ No chats found - Skipping Faye Insights")
         return None
 
     client = AsyncAnthropic(api_key=CLAUDE_API_KEY)
@@ -571,23 +619,25 @@ async def build_faye(user_id, start_date, end_date):
             max_tokens=1024, temperature=0, messages=[{"role": "user", "content": prompt}]
         )
         result = json.loads(extract_json_from_llm_response(msg.content[0].text))
-        logger.info("✅ Faye Insights generated successfully")
         return result
     except Exception as e:
         logger.error(f"❌ Error generating Faye insights: {e}")
         return None
 
-async def build_wellness(user_id, start_date, end_date, primary_goal):
+async def build_wellness(user_id, start_date_utc, end_date_utc, primary_goal, start_date_local, end_date_local, user_tz):
     logger.info("🏗️ Building Wellness Section...")
-    dt_curr = datetime.strptime(start_date, "%Y-%m-%d")
-    prev_start = (dt_curr - timedelta(days=7)).strftime("%Y-%m-%d")
-    prev_end = (dt_curr - timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    dt_curr = datetime.strptime(start_date_local, "%Y-%m-%d")
+    prev_start_local = (dt_curr - timedelta(days=7)).strftime("%Y-%m-%d")
+    prev_end_local = (dt_curr - timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    prev_start_utc, _ = convert_local_date_to_utc_window(prev_start_local, user_tz)
+    _, prev_end_utc = convert_local_date_to_utc_window(prev_end_local, user_tz)
 
-    logger.info("⚡ Parallel Fetch: Wellness Trackers & Scans")
     curr_t, prev_t, scans = await asyncio.gather(
-        fetch_trackers(user_id, start_date, end_date),
-        fetch_trackers(user_id, prev_start, prev_end),
-        fetch_scans(user_id, start_date, end_date)
+        fetch_trackers(user_id, start_date_utc, end_date_utc),
+        fetch_trackers(user_id, prev_start_utc, prev_end_utc),
+        fetch_scans(user_id, start_date_utc, end_date_utc)
     )
 
     wellness = {}
@@ -597,19 +647,28 @@ async def build_wellness(user_id, start_date, end_date, primary_goal):
     total_steps = sum(int(x.get("total_steps", x.get("actual_value", 0))) for x in steps_list)
     if total_steps > 0:
         best = max(steps_list, key=lambda x: int(x.get("total_steps", x.get("actual_value", 0))))
-        try:
-            day_lbl = datetime.strptime(best.get("date", "")[:10], "%Y-%m-%d").strftime("%A")
-        except:
-            day_lbl = "-"
+        day_lbl = "-"
+        
+        # Ensure label uses user timezone if available
+        # Assuming trackers might have ISO timestamps or simple dates
+        best_date_str = best.get("date", "")
+        if "T" in best_date_str: # It's ISO
+             try:
+                utc_dt = datetime.fromisoformat(best_date_str.replace("Z", "+00:00"))
+                local_dt = utc_dt.astimezone(ZoneInfo(user_tz))
+                day_lbl = local_dt.strftime("%A")
+             except: pass
+        elif best_date_str: # It's YYYY-MM-DD
+             try:
+                 day_lbl = datetime.strptime(best_date_str[:10], "%Y-%m-%d").strftime("%A")
+             except: pass
+
         wellness["total_steps"] = {
             "total_weekly_steps": total_steps,
             "best_single_day": {"step_count": int(best.get("total_steps", best.get("actual_value", 0))),
                                 "day_label": day_lbl}
         }
-        logger.info(f"👟 Steps processed: Total={total_steps}")
-    else:
-        logger.debug("ℹ️ No steps data found")
-
+    
     # 2. Mood
     moods = [m.get("actual_value") for m in curr_t.get("MOOD_ENTRY", []) if m.get("actual_value")]
     if len(set(moods)) >= 2:
@@ -630,9 +689,6 @@ async def build_wellness(user_id, start_date, end_date, primary_goal):
                 "visual_size": sizes[i] if i < 3 else "Small"
             })
         wellness["mood_mix"] = {"status": "active", "clusters": clusters}
-        logger.info(f"😊 Mood Mix created: {len(clusters)} clusters")
-    else:
-        logger.debug(f"ℹ️ Insufficient mood diversity (Found {len(set(moods))} unique moods)")
 
     # 3. Scans
     if scans:
@@ -652,9 +708,6 @@ async def build_wellness(user_id, start_date, end_date, primary_goal):
             "best_scan_summary": processed[0],
             "scan_history_sorted_desc": processed[:5]
         }
-        logger.info(f"📸 Scans processed: {len(processed)} items")
-    else:
-        logger.debug("ℹ️ No scans found")
 
     # 4. Sleep
     sleep_list = curr_t.get("SLEEP", [])
@@ -667,7 +720,6 @@ async def build_wellness(user_id, start_date, end_date, primary_goal):
     if valid_sleep > 0:
         avg = total_mins / valid_sleep
         wellness["sleep"] = {"avg_total_sleep_daily": f"{int(avg // 60)}h {int(avg % 60)}m"}
-        logger.info(f"😴 Sleep processed: Avg {int(avg // 60)}h {int(avg % 60)}m")
 
     # 5. Weight
     def get_last_wt(data):
@@ -690,7 +742,6 @@ async def build_wellness(user_id, start_date, end_date, primary_goal):
             "change_7d_label": lbl,
             "positive_change": positive
         }
-        logger.info(f"⚖️ Weight processed: {curr_wt}kg (Delta: {delta}kg)")
 
     return wellness
 
@@ -706,26 +757,35 @@ async def generate_weekly_report(
     start_time = time.time()
     logger.info("=" * 80)
     logger.info(f"🚀 NEW WEEKLY REPORT REQUEST: {request.user_id}")
-    logger.info(f"📅 Range: {request.start_date} to {request.end_date}")
+    logger.info(f"📅 Local Date Range: {request.start_date} to {request.end_date}")
     
     try:
         try:
             datetime.strptime(request.start_date, "%Y-%m-%d")
             datetime.strptime(request.end_date, "%Y-%m-%d")
         except ValueError:
-            logger.error("❌ Invalid date format provided")
             raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD")
 
-        # Step 1: Fetch Goal
-        primary_goal = await fetch_primary_goal(request.user_id)
+        # Step 1: Fetch timezone and goal
+        user_tz, primary_goal = await asyncio.gather(
+            fetch_user_timezone(request.user_id),
+            fetch_primary_goal(request.user_id)
+        )
         
-        # Step 2: Parallel Build
+        # Step 2: Convert local dates to UTC windows
+        start_date_utc_begin, _ = convert_local_date_to_utc_window(request.start_date, user_tz)
+        _, end_date_utc_end = convert_local_date_to_utc_window(request.end_date, user_tz)
+        
+        # Step 3: Parallel Build
         logger.info("⚡ STARTING PARALLEL SECTION BUILD...")
         title_res, nutrition_res, faye_res, wellness_res = await asyncio.gather(
-            build_title_card(request.user_id, request.start_date, request.end_date, primary_goal),
-            build_nutrition(request.user_id, request.start_date, request.end_date, primary_goal),
-            build_faye(request.user_id, request.start_date, request.end_date),
-            build_wellness(request.user_id, request.start_date, request.end_date, primary_goal)
+            build_title_card(request.user_id, start_date_utc_begin, end_date_utc_end, primary_goal, 
+                           request.start_date, request.end_date, user_tz),
+            build_nutrition(request.user_id, start_date_utc_begin, end_date_utc_end, primary_goal,
+                          request.start_date, request.end_date, user_tz),
+            build_faye(request.user_id, start_date_utc_begin, end_date_utc_end),
+            build_wellness(request.user_id, start_date_utc_begin, end_date_utc_end, primary_goal,
+                         request.start_date, request.end_date, user_tz)
         )
         
         final_report = {}
@@ -734,16 +794,12 @@ async def generate_weekly_report(
         if faye_res: final_report["faye_insights"] = faye_res
         if wellness_res: final_report.update(wellness_res)
 
-        gen_time = round(time.time() - start_time, 2)
-        logger.info(f"✅ REPORT GENERATED in {gen_time}s")
-        logger.info(f"📦 Sections Included: {list(final_report.keys())}")
-
-        # Step 3: Post to External
+        # Step 4: Post to External
         external_api_url = "https://api-staging.foodhak.com/weekly-reports/create/"
         payload = {
             "user": request.user_id,
-            "week_start": request.start_date,
-            "week_end": request.end_date,
+            "week_start": request.start_date, # Sending LOCAL date as requested
+            "week_end": request.end_date,     # Sending LOCAL date as requested
             "report_json": final_report
         }
         
@@ -761,7 +817,6 @@ async def generate_weekly_report(
                 return JSONResponse(status_code=200, content=final_report)
             else:
                 logger.warning(f"⚠️ EXTERNAL API FAILURE: Status {external_response.status_code}")
-                logger.warning(f"Response: {external_response.text}")
                 return JSONResponse(
                     status_code=200,
                     content={
@@ -772,7 +827,6 @@ async def generate_weekly_report(
                     }
                 )
         except httpx.HTTPError as e:
-            logger.error(f"❌ EXTERNAL API ERROR: {e}")
             return JSONResponse(
                 status_code=200,
                 content={
