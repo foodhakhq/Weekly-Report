@@ -5,6 +5,7 @@ from typing import Optional
 import json
 import httpx
 import asyncio
+import math
 import re
 import os
 import random
@@ -62,6 +63,20 @@ class WeeklyReportRequest(BaseModel):
     start_date: str  # Format: YYYY-MM-DD (in user's local timezone)
     end_date: str  # Format: YYYY-MM-DD (in user's local timezone)
 
+def safe_float(value):
+    try:
+        if value is None: return 0.0
+        f_val = float(value)
+        if math.isnan(f_val) or math.isinf(f_val): return 0.0
+        return f_val
+    except (ValueError, TypeError):
+        return 0.0
+
+def safe_int(value):
+    try:
+        return int(safe_float(value))
+    except (ValueError, TypeError):
+        return 0
 # ==========================================
 # AUTHENTICATION
 # ==========================================
@@ -241,7 +256,7 @@ async def fetch_daily_target(user_id):
         return 2000
     energy = data["results"].get("Energy", [])
     if energy: 
-        return int(float(energy[0].get("target_value", 2000)))
+        return safe_int(energy[0].get("target_value", 2000))
     return 2000
 
 async def fetch_chats(user_id, start_date_utc, end_date_utc):
@@ -399,11 +414,10 @@ async def build_nutrition(user_id, start_date_utc, end_date_utc, primary_goal, s
                         local_dt = utc_dt.astimezone(ZoneInfo(timezone_str))
                         # 3. Bucket into Local Day
                         date_key = local_dt.strftime("%Y-%m-%d")
-                        
-                        daily_map[date_key]["p"] += float(item.get("protein", 0))
-                        daily_map[date_key]["c"] += float(item.get("carbohydrates", 0))
-                        daily_map[date_key]["f"] += float(item.get("fat", 0))
-                        daily_map[date_key]["k"] += float(item.get("calories", 0))
+                        daily_map[date_key]["p"] += safe_float(item.get("protein"))
+                        daily_map[date_key]["c"] += safe_float(item.get("carbohydrates"))
+                        daily_map[date_key]["f"] += safe_float(item.get("fat"))
+                        daily_map[date_key]["k"] += safe_float(item.get("calories"))
                     except Exception as e:
                         logger.warning(f"Date conversion error in meal: {e}")
                         continue
@@ -421,7 +435,7 @@ async def build_nutrition(user_id, start_date_utc, end_date_utc, primary_goal, s
 
             if d_str in daily_map:
                 stats = daily_map[d_str]
-                eaten = int(stats["k"])
+                eaten = safe_int(stats["k"])
                 
                 totals["p"] += stats["p"]; totals["c"] += stats["c"]
                 totals["f"] += stats["f"]; totals["k"] += stats["k"]
@@ -462,7 +476,7 @@ async def build_nutrition(user_id, start_date_utc, end_date_utc, primary_goal, s
             curr_d += timedelta(days=1)
 
         if logged_count > 0:
-            avgs = {k: int(v/logged_count) for k, v in totals.items()}
+            avgs = {k: safe_int(v/logged_count) for k, v in totals.items()}
         else:
             avgs = {"p": 0, "c": 0, "f": 0, "k": 0}
             
