@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Tuple, Dict, Any, List
 import json
 import httpx
 import asyncio
@@ -26,7 +26,7 @@ OPENSEARCH_USER = os.getenv("OPENSEARCH_USER")
 OPENSEARCH_PWD = os.getenv("OPENSEARCH_PWD")
 VALID_API_KEY = os.getenv("VALID_API_KEY")
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
-
+HEALTHDATA_BEARER=os.getenv("HEALTHDATA_BEARER")
 # ==========================================
 # LOGGING CONFIGURATION
 # ==========================================
@@ -62,6 +62,132 @@ class WeeklyReportRequest(BaseModel):
     user_id: str
     start_date: str  # Format: YYYY-MM-DD (in user's local timezone)
     end_date: str  # Format: YYYY-MM-DD (in user's local timezone)
+
+async def _safe_get(url: str, headers: dict = None, params: dict = None):
+    """Wrapper for HTTP GET requests."""
+    async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
+        return await client.get(url, headers=headers, params=params)
+
+def _parse_iso_utc(date_str: Optional[str]) -> Optional[datetime]:
+    """Parses ISO string or YYYY-MM-DD to datetime object."""
+    if not date_str: return None
+    try:
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            return datetime.strptime(date_str, "%Y-%m-%d")
+        except:
+            return None
+
+def _to_iso_z(dt: datetime) -> str:
+    """Converts datetime to ISO string with Z suffix."""
+    return dt.isoformat().replace("+00:00", "Z")
+
+async def _fetch_tracker(user_id: str, tracker_type: str, start_date: str, end_date: str) -> dict:
+    """Fetch Internal Foodhak Tracker Data (Fallback)."""
+    type_map = {
+        "steps": "STEPS", "sleep": "SLEEP", "weight": "WEIGHT", "mood": "MOOD_ENTRY"
+    }
+    db_type = type_map.get(tracker_type.lower(), tracker_type.upper())
+    url = f"{API_BASE}/user-profile/{user_id}/tracker"
+    query_string = f"type={db_type}&start_datetime={start_date}&end_datetime={end_date}"
+    
+    try:
+        resp = await _safe_get(url, headers=HEADERS, params={"query": query_string})
+        if resp.status_code == 200:
+            data = resp.json()
+            return {"status": "ok", "data": data.get("results", data.get("data", []))}
+        return {"status": "error", "message": f"HTTP {resp.status_code}", "data": []}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "data": []}
+
+async def connection_status(user_id: str) -> Tuple[bool, Optional[str]]:
+    url = "https://staging-healthdata.foodhak.com/api/v1/health/connection-status"
+    headers = {"accept": "application/json", "Authorization": f"Bearer {HEALTHDATA_BEARER}"}
+    params = {"user_id": user_id}
+
+    try:
+        resp = await _safe_get(url, headers=headers, params=params)
+        if resp.status_code != 200:
+            return False, None
+
+        body = resp.json()
+        data = body.get("data", [])
+        if not data:
+            return False, None
+
+        # 1) keep ANY device_type we see
+        last_seen_type = None
+        for conn in data:
+            if conn.get("device_type"):
+                last_seen_type = conn.get("device_type")
+            if conn.get("is_connected"):
+                # 2) connected now
+                return True, conn.get("device_type") or last_seen_type
+
+        # 3) not connected now, but we may still know the type
+        return False, last_seen_type
+    except Exception:
+        return False, None
+
+def parse_dt_safe(ts: str) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+async def foodhak_sleep_steps_fallback(user_id: str, start_date: str = None, end_date: str = None) -> dict:
+    """Internal Fallback Logic."""
+    adj_steps_start = start_date
+    try:
+        s_dt = _parse_iso_utc(start_date)
+        e_dt = _parse_iso_utc(end_date)
+        if s_dt and e_dt and (e_dt - s_dt) < timedelta(hours=24):
+            adj_steps_start = _to_iso_z(e_dt - timedelta(hours=24))
+    except Exception: pass
+
+    sleep_res, steps_res = await asyncio.gather(
+        _fetch_tracker(user_id, "sleep", adj_steps_start, end_date),
+        _fetch_tracker(user_id, "steps", adj_steps_start, end_date),
+    )
+
+    errors = {}
+    if sleep_res["status"] != "ok": errors["sleep"] = sleep_res["message"]
+    if steps_res["status"] != "ok": errors["steps"] = steps_res["message"]
+    
+    if len(errors) == 2:
+        return {"status": "error", "source": "foodhak", "sleep": None, "steps": None, "errors": errors}
+
+    return {
+        "status": "ok" if not errors else "partial",
+        "source": "foodhak",
+        "sleep": [] if "sleep" in errors else sleep_res["data"],
+        "steps": [] if "steps" in errors else steps_res["data"],
+        "errors": errors or None
+    }
+
+async def wearable_api(user_id: str, start_date: str, end_date: str, provider_type: str) -> dict:
+    """Fetch from External Provider via Health Data API."""
+    url = (
+        f"https://staging-healthdata.foodhak.com/api/v1/health/health-data/{user_id}"
+        f"?provider_type={provider_type}&start_date={start_date}&end_date={end_date}"
+    )
+    headers = {"Authorization": f"Bearer {HEALTHDATA_BEARER}"}
+
+    try:
+        resp = await _safe_get(url, headers=headers)
+        if resp.status_code >= 400:
+            return {"status": "error", "message": f"HTTP {resp.status_code}", "source": "provider", "data": None}
+
+        payload = resp.json()
+        return {"status": "ok", "source": "provider", "provider_type": provider_type, "data": payload}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "source": "provider", "data": None}
 
 def safe_float(value):
     try:
@@ -638,124 +764,362 @@ async def build_faye(user_id, start_date_utc, end_date_utc):
         logger.error(f"❌ Error generating Faye insights: {e}")
         return None
 
-async def build_wellness(user_id, start_date_utc, end_date_utc, primary_goal, start_date_local, end_date_local, user_tz):
-    logger.info("🏗️ Building Wellness Section...")
-    
-    dt_curr = datetime.strptime(start_date_local, "%Y-%m-%d")
-    prev_start_local = (dt_curr - timedelta(days=7)).strftime("%Y-%m-%d")
-    prev_end_local = (dt_curr - timedelta(days=1)).strftime("%Y-%m-%d")
-    
-    prev_start_utc, _ = convert_local_date_to_utc_window(prev_start_local, user_tz)
-    _, prev_end_utc = convert_local_date_to_utc_window(prev_end_local, user_tz)
+def bucket_tracker_by_local_day(records: List[dict], user_tz: str, value_key: str):
+    """
+    Buckets tracker records by local YYYY-MM-DD.
+    """
+    buckets = defaultdict(float)
 
-    curr_t, prev_t, scans = await asyncio.gather(
-        fetch_trackers(user_id, start_date_utc, end_date_utc),
-        fetch_trackers(user_id, prev_start_utc, prev_end_utc),
-        fetch_scans(user_id, start_date_utc, end_date_utc)
+    for r in records or []:
+        ts = r.get("timestamp") or r.get("date")
+        if not ts:
+            continue
+
+        try:
+            utc_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            local_dt = utc_dt.astimezone(ZoneInfo(user_tz))
+            day_key = local_dt.strftime("%Y-%m-%d")
+            buckets[day_key] += safe_float(r.get(value_key, 0))
+        except Exception:
+            continue
+
+    return buckets
+
+def bucket_provider_steps(records, user_tz):
+    buckets = defaultdict(int)
+    tz = ZoneInfo(user_tz)
+
+    for r in records:
+        meta = r.get("data", {}).get("metadata", {})
+        start = meta.get("start_time")
+        dt = parse_dt_safe(start)
+        if not dt:
+            continue
+
+        local_day = dt.astimezone(tz).strftime("%Y-%m-%d")
+        steps = r.get("data", {}).get("distance_data", {}).get("steps", 0)
+        buckets[local_day] += int(steps)
+
+    return buckets
+
+
+def bucket_provider_sleep(records, user_tz: str):
+    """
+    Sleep belongs to the 'night of' the start day (bedtime day).
+    Example: 2026-01-02 23:37 -> 2026-01-03 07:18 counts for Jan 2.
+    """
+    buckets = defaultdict(float)
+    tz = ZoneInfo(user_tz)
+
+    for r in records or []:
+        meta = r.get("data", {}).get("metadata", {})
+        if meta.get("is_nap"):
+            continue
+
+        start = meta.get("start_time")
+        dt = parse_dt_safe(start)
+        if not dt:
+            continue
+
+        local_day = dt.astimezone(tz).strftime("%Y-%m-%d")
+
+        total_minutes = sum(
+            safe_float(s.get("total_duration", 0))
+            for s in r.get("data", {}).get("stages", [])
+        )
+
+        buckets[local_day] += float(total_minutes)
+
+    return buckets
+
+
+async def build_wellness(
+    user_id: str,
+    start_date_utc: str,
+    end_date_utc: str,
+    primary_goal: str,
+    start_date_local: str,
+    end_date_local: str,
+    user_tz: str,
+):
+    """
+    Robust weekly wellness:
+    - Fetch provider data (best-effort) for the whole week.
+    - Fetch Foodhak fallback for the whole week.
+    - Merge PER DAY (provider wins if it has data; otherwise fallback).
+    - Aggregate totals + best day + avg sleep.
+    """
+
+    logger.info("🏗️ Building Wellness Section (Robust Weekly Merge: Provider + Foodhak)...")
+
+    start_dt = datetime.strptime(start_date_local, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date_local, "%Y-%m-%d")
+    tz = ZoneInfo(user_tz)
+
+    # ---------------------------
+    # Initialize aggregates
+    # ---------------------------
+    total_steps = 0
+    best_day_steps = 0
+    best_day_label = "-"
+    total_sleep_minutes = 0.0
+    valid_sleep_days = 0
+
+    # ---------------------------
+    # Fetch non-steps/sleep data
+    # ---------------------------
+    scans, mood_data, weight_data = await asyncio.gather(
+        fetch_scans(user_id, start_date_utc, end_date_utc),
+        _fetch_tracker(user_id, "mood", start_date_utc, end_date_utc),
+        _fetch_tracker(user_id, "weight", start_date_utc, end_date_utc),
     )
 
-    wellness = {}
+    # ---------------------------
+    # Provider (best-effort) + Fallback (always)
+    # ---------------------------
+    # Note: your current connection_status returns provider_type only if connected.
+    # For full robustness, ideally update connection_status() to return device_type even if disconnected.
+    _, provider_type = await connection_status(user_id)
 
-    # 1. Steps
-    steps_list = curr_t.get("STEPS", [])
-    total_steps = sum(int(x.get("total_steps", x.get("actual_value", 0))) for x in steps_list)
-    if total_steps > 0:
-        best = max(steps_list, key=lambda x: int(x.get("total_steps", x.get("actual_value", 0))))
-        day_lbl = "-"
+    provider_steps_by_day = defaultdict(int)
+    provider_sleep_by_day = defaultdict(float)
+    provider_steps_present = defaultdict(bool)
+    provider_sleep_present = defaultdict(bool)
+
+    fallback_steps_by_day = defaultdict(int)
+    fallback_sleep_by_day = defaultdict(float)
+    fallback_steps_present = defaultdict(bool)
+    fallback_sleep_present = defaultdict(bool)
+
+    # -------- Provider weekly fetch (best-effort) --------
+    if provider_type:
+        res = await wearable_api(user_id, start_date_utc, end_date_utc, provider_type)
+        if res.get("status") == "ok":
+            provider_records = res.get("data", {}).get("data", []) or []
+
+            steps_records = [r for r in provider_records if r.get("schema_type") == "daily"]
+            sleep_records = [r for r in provider_records if r.get("schema_type") == "sleep"]
+
+            # -------- Provider steps: bucket by local day (start_time) --------
+            for r in steps_records:
+                meta = (r.get("data", {}) or {}).get("metadata", {}) or {}
+                start = meta.get("start_time")
+                dt = parse_dt_safe(start)
+                if not dt:
+                    continue
+
+                day_key = dt.astimezone(tz).strftime("%Y-%m-%d")
+                provider_steps_present[day_key] = True
+
+                steps = (r.get("data", {}) or {}).get("distance_data", {}) or {}
+                provider_steps_by_day[day_key] += int(steps.get("steps", 0))
+
+            # -------- Provider sleep: bucket by "night of" start_time --------
+            # (You requested: night of Jan 2 => bucket by start_time local day)
+            for r in sleep_records:
+                meta = (r.get("data", {}) or {}).get("metadata", {}) or {}
+                if meta.get("is_nap"):
+                    continue
+
+                anchor = meta.get("start_time")  # <- IMPORTANT: start_time for "night of"
+                dt = parse_dt_safe(anchor)
+                if not dt:
+                    continue
+
+                day_key = dt.astimezone(tz).strftime("%Y-%m-%d")
+                provider_sleep_present[day_key] = True
+
+                stages = (r.get("data", {}) or {}).get("stages", []) or []
+                total_minutes = sum(
+                    safe_float(s.get("total_duration", 0)) for s in stages
+                )
+                provider_sleep_by_day[day_key] += float(total_minutes)
+
+    # =========================================================
+    # CHANGE 4: Always fetch fallback and bucket + presence
+    # =========================================================
+    fb = await foodhak_sleep_steps_fallback(user_id, start_date_utc, end_date_utc)
+    fb_steps_records = fb.get("steps", []) or []
+    fb_sleep_records = fb.get("sleep", []) or []
+
+    # -------- Fallback steps: "date" is already the day key --------
+    for r in fb_steps_records:
+        d = r.get("date")
+        if not d:
+            continue
+        fallback_steps_present[d] = True
+        fallback_steps_by_day[d] += int(r.get("total_steps", 0))
+
+    # -------- Fallback sleep: bucket by local day of timestamp --------
+    for r in fb_sleep_records:
+        ts = r.get("timestamp")
+        dt = parse_dt_safe(ts)
+        if not dt:
+            continue
+        day_key = dt.astimezone(tz).strftime("%Y-%m-%d")
+        fallback_sleep_present[day_key] = True
+        fallback_sleep_by_day[day_key] += float(r.get("actual_value", 0))
+
+    # =========================================================
+    # CHANGE 5: Merge PER DAY based on PRESENCE (not >0)
+    # =========================================================
+    steps_by_day = defaultdict(int)
+    sleep_by_day = defaultdict(float)
+    steps_source_by_day: Dict[str, str] = {}
+    sleep_source_by_day: Dict[str, str] = {}
+
+    curr = start_dt
+    while curr <= end_dt:
+        day_key = curr.strftime("%Y-%m-%d")
+
+        # Steps: provider if record present, else fallback if present
+        if provider_steps_present.get(day_key):
+            steps_by_day[day_key] = int(provider_steps_by_day.get(day_key, 0))
+            steps_source_by_day[day_key] = "provider"
+        elif fallback_steps_present.get(day_key):
+            steps_by_day[day_key] = int(fallback_steps_by_day.get(day_key, 0))
+            steps_source_by_day[day_key] = "foodhak"
+        else:
+            steps_source_by_day[day_key] = "none"
         
-        # Ensure label uses user timezone if available
-        # Assuming trackers might have ISO timestamps or simple dates
-        best_date_str = best.get("date", "")
-        if "T" in best_date_str: # It's ISO
-             try:
-                utc_dt = datetime.fromisoformat(best_date_str.replace("Z", "+00:00"))
-                local_dt = utc_dt.astimezone(ZoneInfo(user_tz))
-                day_lbl = local_dt.strftime("%A")
-             except: pass
-        elif best_date_str: # It's YYYY-MM-DD
-             try:
-                 day_lbl = datetime.strptime(best_date_str[:10], "%Y-%m-%d").strftime("%A")
-             except: pass
+        #precedance change
+        # if fallback_steps_present.get(day_key):
+        #     steps_by_day[day_key] = fallback_steps_by_day.get(day_key, 0)
+        #     steps_source_by_day[day_key] = "foodhak"
+        # elif provider_steps_present.get(day_key):
+        #     steps_by_day[day_key] = provider_steps_by_day.get(day_key, 0)
+        #     steps_source_by_day[day_key] = "provider"
 
+
+        # Sleep: provider if record present, else fallback if present
+        if provider_sleep_present.get(day_key):
+            sleep_by_day[day_key] = float(provider_sleep_by_day.get(day_key, 0))
+            sleep_source_by_day[day_key] = "provider"
+        elif fallback_sleep_present.get(day_key):
+            sleep_by_day[day_key] = float(fallback_sleep_by_day.get(day_key, 0))
+            sleep_source_by_day[day_key] = "foodhak"
+        else:
+            sleep_source_by_day[day_key] = "none"
+
+        #precedance change
+        # if fallback_sleep_present.get(day_key):
+        #     sleep_by_day[day_key] = fallback_sleep_by_day.get(day_key, 0)
+        #     sleep_source_by_day[day_key] = "foodhak"
+        # elif provider_sleep_present.get(day_key):
+        #     sleep_by_day[day_key] = provider_sleep_by_day.get(day_key, 0)
+        #     sleep_source_by_day[day_key] = "provider"
+
+
+        curr += timedelta(days=1)
+
+    # =========================================================
+    # CHANGE 6 (optional): Better logs using presence flags
+    # =========================================================
+    provider_steps_days = len([d for d, p in provider_steps_present.items() if p])
+    fallback_steps_days = len([d for d, p in fallback_steps_present.items() if p])
+    provider_sleep_days = len([d for d, p in provider_sleep_present.items() if p])
+    fallback_sleep_days = len([d for d, p in fallback_sleep_present.items() if p])
+    resolved_steps_days = len([d for d, v in steps_by_day.items() if v is not None and steps_source_by_day.get(d) != "none"])
+    resolved_sleep_days = len([d for d, v in sleep_by_day.items() if v is not None and sleep_source_by_day.get(d) != "none"])
+
+    logger.info(
+        f"🩺 Wellness merge | provider_type={provider_type} | "
+        f"provider_steps_days={provider_steps_days} | fallback_steps_days={fallback_steps_days} | resolved_steps_days={resolved_steps_days} | "
+        f"provider_sleep_days={provider_sleep_days} | fallback_sleep_days={fallback_sleep_days} | resolved_sleep_days={resolved_sleep_days}"
+    )
+
+    # =========================================================
+    # Existing aggregation logic (keep as-is)
+    # =========================================================
+    curr = start_dt
+    while curr <= end_dt:
+        day_key = curr.strftime("%Y-%m-%d")
+
+        d_steps = int(steps_by_day.get(day_key, 0))
+        d_sleep = float(sleep_by_day.get(day_key, 0))
+
+        total_steps += d_steps
+        if d_steps > best_day_steps:
+            best_day_steps = d_steps
+            best_day_label = curr.strftime("%A")
+
+        if d_sleep > 0:
+            total_sleep_minutes += d_sleep
+            valid_sleep_days += 1
+
+        curr += timedelta(days=1)
+
+    wellness: Dict[str, Any] = {}
+
+    if total_steps > 0:
         wellness["total_steps"] = {
             "total_weekly_steps": total_steps,
-            "best_single_day": {"step_count": int(best.get("total_steps", best.get("actual_value", 0))),
-                                "day_label": day_lbl}
+            "best_single_day": {
+                "step_count": best_day_steps,
+                "day_label": best_day_label,
+            },
         }
-    
-    # 2. Mood
-    moods = [m.get("actual_value") for m in curr_t.get("MOOD_ENTRY", []) if m.get("actual_value")]
-    if len(set(moods)) >= 2:
-        counts = Counter(moods).most_common(3)
-        clusters = []
-        sizes = ["Large", "Medium", "Small"]
-        emojis = {
-            "HAPPY": "😊", "SAD": "😢", "ENERGETIC": "⚡", "FRISKY": "😏",
-            "MOOD SWINGS": "🎭", "IRRITATED": "😠", "ANXIOUS": "😰", "DEPRESSED": "😞",
-            "LOW ENERGY": "🔋", "CONFUSED": "😕", "APATHETIC": "😐", "CUSTOM": "✨"
-        }
-        if len(counts) == 2: random.shuffle(counts)
-        for i, (mood_name, count) in enumerate(counts):
-            clusters.append({
-                "mood_name": mood_name,
-                "emoji": emojis.get(mood_name, "😐"),
-                "count": count,
-                "visual_size": sizes[i] if i < 3 else "Small"
-            })
-        wellness["mood_mix"] = {"status": "active", "clusters": clusters}
 
-    # 3. Scans
+    if valid_sleep_days > 0:
+        avg_sleep = total_sleep_minutes / valid_sleep_days
+        wellness["sleep"] = {
+            "avg_total_sleep_daily": f"{int(avg_sleep // 60)}h {int(avg_sleep % 60)}m"
+        }
+
+    # ---------------- Mood ----------------
+    if mood_data.get("status") == "ok":
+        vals = [
+            m.get("actual_value")
+            for m in (mood_data.get("data") or [])
+            if m.get("actual_value")
+        ]
+        if len(set(vals)) >= 2:
+            counts = Counter(vals).most_common(3)
+            sizes = ["Large", "Medium", "Small"]
+            wellness["mood_mix"] = {
+                "status": "active",
+                "clusters": [
+                    {"mood_name": k, "count": v, "visual_size": sizes[i]}
+                    for i, (k, v) in enumerate(counts)
+                ],
+            }
+
+    # ---------------- Scans ----------------
     if scans:
         processed = []
         for s in scans:
-            name = s.get("name", "Unknown Item")
-            try:
-                score = float(s.get("foodhak_score", {}).get("Score", 0) if isinstance(s.get("foodhak_score"), dict) else s.get("foodhak_score", 0))
-            except:
-                score = 0.0
-            image_url = s.get("image_url") or s.get("image") or s.get("product_image") or s.get("img_url") or None
-            scan_item = {"product_name": name, "score": score}
-            if image_url: scan_item["image_url"] = image_url
-            processed.append(scan_item)
+            scr = s.get("foodhak_score")
+            score = safe_float(scr.get("Score")) if isinstance(scr, dict) else safe_float(scr)
+            processed.append(
+                {
+                    "product_name": s.get("name"),
+                    "score": score,
+                    "image_url": s.get("image_url"),
+                }
+            )
+
         processed.sort(key=lambda x: x["score"], reverse=True)
         wellness["top_scan"] = {
             "best_scan_summary": processed[0],
-            "scan_history_sorted_desc": processed[:5]
+            "scan_history_sorted_desc": processed[:5],
         }
 
-    # 4. Sleep
-    sleep_list = curr_t.get("SLEEP", [])
-    total_mins = 0; valid_sleep = 0
-    for s in sleep_list:
+    # ---------------- Weight ----------------
+    if weight_data.get("status") == "ok":
         try:
-            v = float(s.get("actual_value", 0))
-            if v > 0: total_mins += v; valid_sleep += 1
-        except: continue
-    if valid_sleep > 0:
-        avg = total_mins / valid_sleep
-        wellness["sleep"] = {"avg_total_sleep_daily": f"{int(avg // 60)}h {int(avg % 60)}m"}
-
-    # 5. Weight
-    def get_last_wt(data):
-        if not data: return None
-        try:
-            return float(sorted(data, key=lambda x: x.get("timestamp", ""), reverse=True)[0].get("actual_value"))
-        except: return None
-
-    curr_wt = get_last_wt(curr_t.get("WEIGHT"))
-    prev_wt = get_last_wt(prev_t.get("WEIGHT"))
-
-    if curr_wt:
-        delta = round(curr_wt - prev_wt, 1) if prev_wt else 0
-        positive = is_positive_change(delta, 'weight', primary_goal)
-        lbl = f"gained {delta}kg" if delta > 0 else f"lost {abs(delta)}kg" if delta < 0 else "no change"
-        wellness["weight"] = {
-            "current_value": curr_wt,
-            "unit": "kg",
-            "change_7d_value": delta,
-            "change_7d_label": lbl,
-            "positive_change": positive
-        }
+            latest = sorted(
+                weight_data.get("data") or [],
+                key=lambda x: x.get("timestamp", ""),
+                reverse=True,
+            )[0]
+            wt = float(latest.get("actual_value"))
+            wellness["weight"] = {
+                "current_value": wt,
+                "unit": "kg",
+                "change_7d_label": "no change",
+            }
+        except Exception:
+            pass
 
     return wellness
 
