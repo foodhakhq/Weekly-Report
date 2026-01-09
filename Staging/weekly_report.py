@@ -26,7 +26,7 @@ OPENSEARCH_USER = os.getenv("OPENSEARCH_USER")
 OPENSEARCH_PWD = os.getenv("OPENSEARCH_PWD")
 VALID_API_KEY = os.getenv("VALID_API_KEY")
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
-HEALTHDATA_BEARER=os.getenv("HEALTHDATA_BEARER")
+HEALTHDATA_BEARER="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbiIsImV4cCI6MTgxNTMwMDg0MH0.TPj0mDBuk9EHFUcUaTZq8XTkKcK7Q4JfAcKUdjDGsw8"
 # ==========================================
 # LOGGING CONFIGURATION
 # ==========================================
@@ -832,7 +832,22 @@ def bucket_provider_sleep(records, user_tz: str):
 
     return buckets
 
-
+async def fetch_weight_direct(user_id: str) -> dict:
+    """
+    Fetches weight from the specific /trackers/foodhak-user/ endpoint.
+    """
+    url = f"{API_BASE}/trackers/foodhak-user/{user_id}/weight"
+    logger.info(f"⚖️ Fetching weight direct from: {url}")
+    try:
+        resp = await _safe_get(url, headers=HEADERS)
+        if resp.status_code == 200:
+            return {"status": "ok", "data": resp.json()}
+        logger.warning(f"⚠️ Weight fetch failed: {resp.status_code}")
+        return {"status": "error", "message": f"HTTP {resp.status_code}", "data": {}}
+    except Exception as e:
+        logger.error(f"❌ Error fetching weight direct: {e}")
+        return {"status": "error", "message": str(e), "data": {}}
+    
 async def build_wellness(
     user_id: str,
     start_date_utc: str,
@@ -871,7 +886,7 @@ async def build_wellness(
     scans, mood_data, weight_data = await asyncio.gather(
         fetch_scans(user_id, start_date_utc, end_date_utc),
         _fetch_tracker(user_id, "mood", start_date_utc, end_date_utc),
-        _fetch_tracker(user_id, "weight", start_date_utc, end_date_utc),
+        fetch_weight_direct(user_id),
     )
 
     # ---------------------------
@@ -1075,51 +1090,137 @@ async def build_wellness(
         ]
         if len(set(vals)) >= 2:
             counts = Counter(vals).most_common(3)
+            clusters = []
             sizes = ["Large", "Medium", "Small"]
-            wellness["mood_mix"] = {
-                "status": "active",
-                "clusters": [
-                    {"mood_name": k, "count": v, "visual_size": sizes[i]}
-                    for i, (k, v) in enumerate(counts)
-                ],
+            emojis = {
+                "HAPPY": "😊", "SAD": "😢", "ENERGETIC": "⚡", "FRISKY": "😏",
+                "MOOD SWINGS": "🎭", "IRRITATED": "😠", "ANXIOUS": "😰", "DEPRESSED": "😞",
+                "LOW ENERGY": "🔋", "CONFUSED": "😕", "APATHETIC": "😐", "CUSTOM": "✨"
             }
+            if len(counts) == 2: 
+                random.shuffle(counts)
+            for i, (mood_name, count) in enumerate(counts):
+                clusters.append({
+                    "mood_name": mood_name,
+                    "emoji": emojis.get(mood_name, "😐"),
+                    "count": count,
+                    "visual_size": sizes[i] if i < 3 else "Small"
+                })
+            wellness["mood_mix"] = {"status": "active", "clusters": clusters}
+            logger.info(f"😊 Mood Mix created: {len(clusters)} clusters")
+        else:
+            logger.debug(f"ℹ️ Insufficient mood diversity (Found {len(set(vals))} unique moods)")
+    else:
+        logger.debug("ℹ️ No mood data found")
 
     # ---------------- Scans ----------------
     if scans:
         processed = []
         for s in scans:
-            scr = s.get("foodhak_score")
-            score = safe_float(scr.get("Score")) if isinstance(scr, dict) else safe_float(scr)
-            processed.append(
-                {
-                    "product_name": s.get("name"),
-                    "score": score,
-                    "image_url": s.get("image_url"),
-                }
-            )
-
+            name = s.get("name", "Unknown Item")
+            try:
+                score = float(s.get("foodhak_score", {}).get("Score", 0) if isinstance(s.get("foodhak_score"), dict) else s.get("foodhak_score", 0))
+            except:
+                score = 0.0
+            image_url = s.get("image_url") or s.get("image") or s.get("product_image") or s.get("img_url") or None
+            scan_item = {"product_name": name, "score": score}
+            if image_url: 
+                scan_item["image_url"] = image_url
+            processed.append(scan_item)
         processed.sort(key=lambda x: x["score"], reverse=True)
         wellness["top_scan"] = {
             "best_scan_summary": processed[0],
-            "scan_history_sorted_desc": processed[:5],
+            "scan_history_sorted_desc": processed[:5]
         }
+        logger.info(f"📸 Scans processed: {len(processed)} items")
+    else:
+        logger.debug("ℹ️ No scans found")
 
     # ---------------- Weight ----------------
-    if weight_data.get("status") == "ok":
+    def get_last_weight_from_data(data_obj):
+        """Get the most recent weight entry from fetch_weight_direct response"""
+        if data_obj.get("status") != "ok" or "results" not in data_obj.get("data", {}):
+            return None
         try:
+            results = data_obj["data"]["results"]
+            if not results:
+                return None
+            
+            # Sort by timestamp descending (newest first) to get current weight
             latest = sorted(
-                weight_data.get("data") or [],
+                results,
                 key=lambda x: x.get("timestamp", ""),
-                reverse=True,
+                reverse=True
             )[0]
-            wt = float(latest.get("actual_value"))
-            wellness["weight"] = {
-                "current_value": wt,
-                "unit": "kg",
-                "change_7d_label": "no change",
-            }
-        except Exception:
-            pass
+            
+            return float(latest.get("actual_value"))
+        except Exception as e:
+            logger.error(f"Error processing weight data: {e}")
+            return None
+    
+    def get_weight_7d_ago(data_obj, current_date_local, user_tz):
+        """Get weight entry from 7 days ago"""
+        if data_obj.get("status") != "ok" or "results" not in data_obj.get("data", {}):
+            return None
+        try:
+            results = data_obj["data"]["results"]
+            if not results:
+                return None
+            
+            # Calculate 7 days ago date range
+            dt_curr = datetime.strptime(current_date_local, "%Y-%m-%d")
+            prev_start_local = (dt_curr - timedelta(days=7)).strftime("%Y-%m-%d")
+            prev_end_local = (dt_curr - timedelta(days=1)).strftime("%Y-%m-%d")
+            
+            # Convert to UTC for comparison
+            prev_start_utc, _ = convert_local_date_to_utc_window(prev_start_local, user_tz)
+            _, prev_end_utc = convert_local_date_to_utc_window(prev_end_local, user_tz)
+            
+            start_dt = datetime.fromisoformat(prev_start_utc.replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(prev_end_utc.replace("Z", "+00:00"))
+            
+            # Filter entries within previous week range
+            valid_entries = []
+            for entry in results:
+                ts = entry.get("timestamp")
+                if ts:
+                    try:
+                        entry_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        if start_dt <= entry_dt <= end_dt:
+                            valid_entries.append(entry)
+                    except:
+                        continue
+            
+            if valid_entries:
+                # Get the latest entry from that week
+                latest = sorted(valid_entries, key=lambda x: x.get("timestamp", ""), reverse=True)[0]
+                return float(latest.get("actual_value"))
+            return None
+        except Exception as e:
+            logger.error(f"Error processing previous weight data: {e}")
+            return None
+    
+    # Get current weight (most recent entry)
+    curr_wt = get_last_weight_from_data(weight_data)
+    
+    # Get weight from 7 days ago (from same dataset)
+    prev_wt = get_weight_7d_ago(weight_data, end_date_local, user_tz)
+    
+    if curr_wt:
+        delta = round(curr_wt - prev_wt, 1) if prev_wt else 0
+        positive = is_positive_change(delta, 'weight', primary_goal)
+        lbl = f"gained {delta}kg" if delta > 0 else f"lost {abs(delta)}kg" if delta < 0 else "no change"
+        wellness["weight"] = {
+            "current_value": curr_wt,
+            "unit": "kg",
+            "change_7d_value": delta,
+            "change_7d_label": lbl,
+            "positive_change": positive
+        }
+        logger.info(f"⚖️ Weight processed: {curr_wt}kg (Delta: {delta}kg)")
+    else:
+        logger.debug("ℹ️ No weight data found")
+
 
     return wellness
 
