@@ -495,7 +495,7 @@ async def build_title_card(user_id, start_date_utc, end_date_utc, goal, start_da
         curr += timedelta(days=1)
 
     return {
-        "title": "Your week in review",
+        "title": "Weekly Summary",
         "date_range": date_range,
         "primary_weight_goal": goal,
         "sun_sat_overview": {
@@ -1301,7 +1301,7 @@ async def generate_weekly_report(
                     content={
                         "status": "partial_success",
                         "message": "Weekly report generated but failed to post to external API",
-                        "weekly_summary_report": final_report,
+                        "report_json": final_report,
                         "external_api_error": external_response.text
                     }
                 )
@@ -1311,7 +1311,7 @@ async def generate_weekly_report(
                 content={
                     "status": "partial_success",
                     "message": "Weekly report generated but failed to post to external API",
-                    "weekly_summary_report": final_report,
+                    "report_json": final_report,
                     "external_api_error": str(e)
                 }
             )
