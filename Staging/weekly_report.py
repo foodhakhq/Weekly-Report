@@ -764,26 +764,54 @@ async def build_faye(user_id, start_date_utc, end_date_utc):
         logger.error(f"❌ Error generating Faye insights: {e}")
         return None
 
-def bucket_tracker_by_local_day(records: List[dict], user_tz: str, value_key: str):
+def bucket_tracker_by_local_day(records: List[dict], user_tz: str, value_key: str, deduplicate: bool = False):
     """
     Buckets tracker records by local YYYY-MM-DD.
+    If deduplicate=True, keeps only the latest entry per day (for sleep/weight).
     """
-    buckets = defaultdict(float)
+    if deduplicate:
+        # For sleep/weight: keep only the latest timestamp per day
+        day_entries = defaultdict(list)
+        
+        for r in records or []:
+            ts = r.get("timestamp") or r.get("date")
+            if not ts:
+                continue
+            
+            try:
+                utc_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                local_dt = utc_dt.astimezone(ZoneInfo(user_tz))
+                day_key = local_dt.strftime("%Y-%m-%d")
+                day_entries[day_key].append((utc_dt, safe_float(r.get(value_key, 0))))
+            except Exception:
+                continue
+        
+        # Keep only the latest entry per day
+        buckets = {}
+        for day_key, entries in day_entries.items():
+            # Sort by timestamp and take the last one
+            latest_entry = sorted(entries, key=lambda x: x[0])[-1]
+            buckets[day_key] = latest_entry[1]
+        
+        return buckets
+    else:
+        # For steps: sum all values per day
+        buckets = defaultdict(float)
+        
+        for r in records or []:
+            ts = r.get("timestamp") or r.get("date")
+            if not ts:
+                continue
 
-    for r in records or []:
-        ts = r.get("timestamp") or r.get("date")
-        if not ts:
-            continue
+            try:
+                utc_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                local_dt = utc_dt.astimezone(ZoneInfo(user_tz))
+                day_key = local_dt.strftime("%Y-%m-%d")
+                buckets[day_key] += safe_float(r.get(value_key, 0))
+            except Exception:
+                continue
 
-        try:
-            utc_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            local_dt = utc_dt.astimezone(ZoneInfo(user_tz))
-            day_key = local_dt.strftime("%Y-%m-%d")
-            buckets[day_key] += safe_float(r.get(value_key, 0))
-        except Exception:
-            continue
-
-    return buckets
+        return buckets
 
 def bucket_provider_steps(records, user_tz):
     buckets = defaultdict(int)
@@ -966,14 +994,20 @@ async def build_wellness(
         fallback_steps_by_day[d] += int(r.get("total_steps", 0))
 
     # -------- Fallback sleep: bucket by local day of timestamp --------
+    fallback_sleep_timestamps = {}  
+
     for r in fb_sleep_records:
         ts = r.get("timestamp")
         dt = parse_dt_safe(ts)
         if not dt:
             continue
         day_key = dt.astimezone(tz).strftime("%Y-%m-%d")
-        fallback_sleep_present[day_key] = True
-        fallback_sleep_by_day[day_key] += float(r.get("actual_value", 0))
+        
+        # Keep only the latest entry per day
+        if day_key not in fallback_sleep_by_day or dt > fallback_sleep_timestamps.get(day_key, datetime.min.replace(tzinfo=timezone.utc)):
+            fallback_sleep_present[day_key] = True
+            fallback_sleep_by_day[day_key] = float(r.get("actual_value", 0))
+            fallback_sleep_timestamps[day_key] = dt
 
     # =========================================================
     # CHANGE 5: Merge PER DAY based on PRESENCE (not >0)
@@ -1088,17 +1122,33 @@ async def build_wellness(
             for m in (mood_data.get("data") or [])
             if m.get("actual_value")
         ]
-        if len(set(vals)) >= 2:
+        
+        unique_moods = len(set(vals))
+        
+        # Need at least 2 different mood types for mood mix
+        if unique_moods >= 2:
             counts = Counter(vals).most_common(3)
             clusters = []
             sizes = ["Large", "Medium", "Small"]
             emojis = {
-                "HAPPY": "😊", "SAD": "😢", "ENERGETIC": "⚡", "FRISKY": "😏",
-                "MOOD SWINGS": "🎭", "IRRITATED": "😠", "ANXIOUS": "😰", "DEPRESSED": "😞",
-                "LOW ENERGY": "🔋", "CONFUSED": "😕", "APATHETIC": "😐", "CUSTOM": "✨"
+                "HAPPY": "😁",
+                "SAD": "😔",
+                "ENERGETIC": "😎",
+                "FRISKY": "🤪",
+                "MOOD SWINGS": "🫠",
+                "IRRITATED": "🙄",
+                "ANXIOUS": "😰",
+                "DEPRESSED": "😞",
+                "LOW ENERGY": "🤕",
+                "CONFUSED": "😵‍💫",
+                "APATHETIC": "😐",
+                "CUSTOM": "😶"
             }
-            if len(counts) == 2: 
+            
+            # Randomize only if exactly 2 moods AND they have the same count (tie)
+            if len(counts) == 2 and counts[0][1] == counts[1][1]:
                 random.shuffle(counts)
+            
             for i, (mood_name, count) in enumerate(counts):
                 clusters.append({
                     "mood_name": mood_name,
@@ -1106,10 +1156,11 @@ async def build_wellness(
                     "count": count,
                     "visual_size": sizes[i] if i < 3 else "Small"
                 })
+            
             wellness["mood_mix"] = {"status": "active", "clusters": clusters}
-            logger.info(f"😊 Mood Mix created: {len(clusters)} clusters")
+            logger.info(f"😊 Mood Mix created: {len(clusters)} clusters (unique_moods={unique_moods})")
         else:
-            logger.debug(f"ℹ️ Insufficient mood diversity (Found {len(set(vals))} unique moods)")
+            logger.debug(f"ℹ️ Insufficient mood diversity (Found {unique_moods} unique mood(s), need 2+)")
     else:
         logger.debug("ℹ️ No mood data found")
 
@@ -1120,6 +1171,7 @@ async def build_wellness(
             name = s.get("name", "Unknown Item")
             try:
                 score = float(s.get("foodhak_score", {}).get("Score", 0) if isinstance(s.get("foodhak_score"), dict) else s.get("foodhak_score", 0))
+                score = round(score, 1)
             except:
                 score = 0.0
             image_url = s.get("image_url") or s.get("image") or s.get("product_image") or s.get("img_url") or None
@@ -1137,8 +1189,8 @@ async def build_wellness(
         logger.debug("ℹ️ No scans found")
 
     # ---------------- Weight ----------------
-    def get_last_weight_from_data(data_obj):
-        """Get the most recent weight entry from fetch_weight_direct response"""
+    def get_latest_weight_in_range(data_obj, start_date_local, end_date_local, user_tz):
+        """Get the most recent weight entry within a specific date range"""
         if data_obj.get("status") != "ok" or "results" not in data_obj.get("data", {}):
             return None
         try:
@@ -1146,7 +1198,81 @@ async def build_wellness(
             if not results:
                 return None
             
-            # Sort by timestamp descending (newest first) to get current weight
+            # Convert date range to UTC
+            start_utc, _ = convert_local_date_to_utc_window(start_date_local, user_tz)
+            _, end_utc = convert_local_date_to_utc_window(end_date_local, user_tz)
+            
+            start_dt = datetime.fromisoformat(start_utc.replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(end_utc.replace("Z", "+00:00"))
+            
+            # Filter entries within the date range
+            valid_entries = []
+            for entry in results:
+                ts = entry.get("timestamp")
+                if ts:
+                    try:
+                        entry_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        if start_dt <= entry_dt < end_dt:
+                            valid_entries.append((entry_dt, float(entry.get("actual_value"))))
+                    except:
+                        continue
+            
+            if valid_entries:
+                # Get the most recent entry in this range
+                latest = sorted(valid_entries, key=lambda x: x[0], reverse=True)[0]
+                return latest[1]
+            return None
+        except Exception as e:
+            logger.error(f"Error processing weight data: {e}")
+            return None
+
+    def get_first_weight_in_range(data_obj, start_date_local, end_date_local, user_tz):
+        """Get the first (earliest) weight entry within a specific date range"""
+        if data_obj.get("status") != "ok" or "results" not in data_obj.get("data", {}):
+            return None
+        try:
+            results = data_obj["data"]["results"]
+            if not results:
+                return None
+            
+            # Convert date range to UTC
+            start_utc, _ = convert_local_date_to_utc_window(start_date_local, user_tz)
+            _, end_utc = convert_local_date_to_utc_window(end_date_local, user_tz)
+            
+            start_dt = datetime.fromisoformat(start_utc.replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(end_utc.replace("Z", "+00:00"))
+            
+            # Filter entries within the date range
+            valid_entries = []
+            for entry in results:
+                ts = entry.get("timestamp")
+                if ts:
+                    try:
+                        entry_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        if start_dt <= entry_dt < end_dt:
+                            valid_entries.append((entry_dt, float(entry.get("actual_value"))))
+                    except:
+                        continue
+            
+            if valid_entries:
+                # Get the earliest entry in this range
+                earliest = sorted(valid_entries, key=lambda x: x[0])[0]
+                return earliest[1]
+            return None
+        except Exception as e:
+            logger.error(f"Error processing weight data: {e}")
+            return None
+
+    def get_most_recent_weight(data_obj):
+        """Get the absolute most recent weight entry (for display purposes)"""
+        if data_obj.get("status") != "ok" or "results" not in data_obj.get("data", {}):
+            return None
+        try:
+            results = data_obj["data"]["results"]
+            if not results:
+                return None
+            
+            # Sort by timestamp descending to get the most recent
             latest = sorted(
                 results,
                 key=lambda x: x.get("timestamp", ""),
@@ -1157,67 +1283,74 @@ async def build_wellness(
         except Exception as e:
             logger.error(f"Error processing weight data: {e}")
             return None
-    
-    def get_weight_7d_ago(data_obj, current_date_local, user_tz):
-        """Get weight entry from 7 days ago"""
-        if data_obj.get("status") != "ok" or "results" not in data_obj.get("data", {}):
-            return None
-        try:
-            results = data_obj["data"]["results"]
-            if not results:
-                return None
-            
-            # Calculate 7 days ago date range
-            dt_curr = datetime.strptime(current_date_local, "%Y-%m-%d")
-            prev_start_local = (dt_curr - timedelta(days=7)).strftime("%Y-%m-%d")
-            prev_end_local = (dt_curr - timedelta(days=1)).strftime("%Y-%m-%d")
-            
-            # Convert to UTC for comparison
-            prev_start_utc, _ = convert_local_date_to_utc_window(prev_start_local, user_tz)
-            _, prev_end_utc = convert_local_date_to_utc_window(prev_end_local, user_tz)
-            
-            start_dt = datetime.fromisoformat(prev_start_utc.replace("Z", "+00:00"))
-            end_dt = datetime.fromisoformat(prev_end_utc.replace("Z", "+00:00"))
-            
-            # Filter entries within previous week range
-            valid_entries = []
-            for entry in results:
-                ts = entry.get("timestamp")
-                if ts:
-                    try:
-                        entry_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                        if start_dt <= entry_dt <= end_dt:
-                            valid_entries.append(entry)
-                    except:
-                        continue
-            
-            if valid_entries:
-                # Get the latest entry from that week
-                latest = sorted(valid_entries, key=lambda x: x.get("timestamp", ""), reverse=True)[0]
-                return float(latest.get("actual_value"))
-            return None
-        except Exception as e:
-            logger.error(f"Error processing previous weight data: {e}")
-            return None
-    
-    # Get current weight (most recent entry)
-    curr_wt = get_last_weight_from_data(weight_data)
-    
-    # Get weight from 7 days ago (from same dataset)
-    prev_wt = get_weight_7d_ago(weight_data, end_date_local, user_tz)
-    
-    if curr_wt:
-        delta = round(curr_wt - prev_wt, 1) if prev_wt else 0
-        positive = is_positive_change(delta, 'weight', primary_goal)
-        lbl = f"gained {delta}kg" if delta > 0 else f"lost {abs(delta)}kg" if delta < 0 else "no change"
+
+    # Calculate previous week dates (7 days before start_date)
+    start_dt = datetime.strptime(start_date_local, "%Y-%m-%d")
+    prev_week_start_local = (start_dt - timedelta(days=7)).strftime("%Y-%m-%d")
+    prev_week_end_local = (start_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Get latest weight from CURRENT WEEK
+    curr_week_weight = get_latest_weight_in_range(weight_data, start_date_local, end_date_local, user_tz)
+
+    # Get latest weight from PREVIOUS WEEK
+    prev_week_weight = get_latest_weight_in_range(weight_data, prev_week_start_local, prev_week_end_local, user_tz)
+
+    # Get first weight from CURRENT WEEK (for fallback comparison)
+    curr_week_first_weight = get_first_weight_in_range(weight_data, start_date_local, end_date_local, user_tz)
+
+    # Get absolute most recent weight for display
+    most_recent_weight = get_most_recent_weight(weight_data)
+
+    if most_recent_weight:
+        # Priority 1: Compare with previous week's latest weight
+        if curr_week_weight and prev_week_weight:
+            delta = round(curr_week_weight - prev_week_weight, 1)
+            positive = is_positive_change(delta, 'weight', primary_goal)
+            if delta > 0:
+                lbl = f"gained {delta}kg"
+            elif delta < 0:
+                lbl = f"lost {abs(delta)}kg"
+            else:
+                lbl = "no change"
+            logger.info(
+                f"⚖️ Weight (Priority 1): Current={most_recent_weight}kg, "
+                f"This Week Latest={curr_week_weight}kg, "
+                f"Prev Week Latest={prev_week_weight}kg, "
+                f"Delta={delta}kg"
+            )
+        # Priority 2: Compare with current week's first weight
+        elif curr_week_weight and curr_week_first_weight and curr_week_weight != curr_week_first_weight:
+            delta = round(curr_week_weight - curr_week_first_weight, 1)
+            positive = is_positive_change(delta, 'weight', primary_goal)
+            if delta > 0:
+                lbl = f"gained {delta}kg"
+            elif delta < 0:
+                lbl = f"lost {abs(delta)}kg"
+            else:
+                lbl = "no change"
+            logger.info(
+                f"⚖️ Weight (Priority 2): Current={most_recent_weight}kg, "
+                f"This Week Latest={curr_week_weight}kg, "
+                f"This Week First={curr_week_first_weight}kg, "
+                f"Delta={delta}kg"
+            )
+        # Priority 3: No comparison possible
+        else:
+            delta = 0
+            positive = False
+            lbl = "no change"
+            logger.info(
+                f"⚖️ Weight (Priority 3): Current={most_recent_weight}kg, "
+                f"No comparison data available (change=n/a)"
+            )
+        
         wellness["weight"] = {
-            "current_value": curr_wt,
+            "current_value": most_recent_weight,
             "unit": "kg",
             "change_7d_value": delta,
             "change_7d_label": lbl,
             "positive_change": positive
         }
-        logger.info(f"⚖️ Weight processed: {curr_wt}kg (Delta: {delta}kg)")
     else:
         logger.debug("ℹ️ No weight data found")
 
