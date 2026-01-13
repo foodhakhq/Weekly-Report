@@ -472,14 +472,6 @@ def is_positive_change(delta, metric_type, goal):
 async def build_title_card(user_id, start_date_utc, end_date_utc, goal, start_date_local, end_date_local, user_tz):
     logger.info("Building Title Card...")
     
-    # Pass user_tz to correctly identify active days
-    active_dates = await fetch_active_days(user_id, start_date_utc, end_date_utc, user_tz)
-    
-    days_map = {
-        "sunday": False, "monday": False, "tuesday": False,
-        "wednesday": False, "thursday": False, "friday": False, "saturday": False
-    }
-
     start_dt = datetime.strptime(start_date_local, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date_local, "%Y-%m-%d")
 
@@ -488,18 +480,119 @@ async def build_title_card(user_id, start_date_utc, end_date_utc, goal, start_da
     else:
         date_range = f"{start_dt.day} {start_dt.strftime('%b')} - {end_dt.day} {end_dt.strftime('%b')} {start_dt.year}"
 
+    # Check connection status
+    is_connected, provider_type = await connection_status(user_id)
+    
+    # Fetch data in parallel
+    meals_data, manual_steps_data, manual_sleep_data = await asyncio.gather(
+        fetch_meals(user_id, start_date_utc, end_date_utc),
+        _fetch_tracker(user_id, "steps", start_date_utc, end_date_utc),
+        _fetch_tracker(user_id, "sleep", start_date_utc, end_date_utc)
+    )
+    
+    # Extract meal dates (convert UTC to local)
+    meal_dates = set()
+    if meals_data and "results" in meals_data:
+        for item in meals_data["results"]:
+            ts = item.get("timestamp")
+            if ts:
+                try:
+                    utc_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    local_dt = utc_dt.astimezone(ZoneInfo(user_tz))
+                    meal_dates.add(local_dt.strftime("%Y-%m-%d"))
+                except:
+                    continue
+    
+    # Extract manual steps dates
+    manual_steps_dates = set()
+    if manual_steps_data.get("status") == "ok":
+        for item in manual_steps_data.get("data", []):
+            date_str = item.get("date")
+            if date_str:
+                manual_steps_dates.add(date_str)
+    
+    # Extract manual sleep dates (convert UTC to local)
+    manual_sleep_dates = set()
+    if manual_sleep_data.get("status") == "ok":
+        for item in manual_sleep_data.get("data", []):
+            ts = item.get("timestamp")
+            if ts:
+                try:
+                    utc_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    local_dt = utc_dt.astimezone(ZoneInfo(user_tz))
+                    manual_sleep_dates.add(local_dt.strftime("%Y-%m-%d"))
+                except:
+                    continue
+    
+    # For connected users: check if they have wearable data (steps OR sleep from provider)
+    wearable_steps_dates = set()
+    wearable_sleep_dates = set()
+    if is_connected and provider_type:
+        provider_res = await wearable_api(user_id, start_date_utc, end_date_utc, provider_type)
+        if provider_res.get("status") == "ok":
+            provider_records = provider_res.get("data", {}).get("data", []) or []
+            
+            # Extract wearable steps dates
+            steps_records = [r for r in provider_records if r.get("schema_type") == "daily"]
+            for r in steps_records:
+                meta = (r.get("data", {}) or {}).get("metadata", {}) or {}
+                start = meta.get("start_time")
+                dt = parse_dt_safe(start)
+                if dt:
+                    day_key = dt.astimezone(ZoneInfo(user_tz)).strftime("%Y-%m-%d")
+                    wearable_steps_dates.add(day_key)
+            
+            # Extract wearable sleep dates
+            sleep_records = [r for r in provider_records if r.get("schema_type") == "sleep"]
+            for r in sleep_records:
+                meta = (r.get("data", {}) or {}).get("metadata", {}) or {}
+                if not meta.get("is_nap"):
+                    start = meta.get("start_time")
+                    dt = parse_dt_safe(start)
+                    if dt:
+                        day_key = dt.astimezone(ZoneInfo(user_tz)).strftime("%Y-%m-%d")
+                        wearable_sleep_dates.add(day_key)
+    
+    # Build day-by-day activity map
+    days_map = {}
     curr = start_dt
     while curr <= end_dt:
-        if curr.strftime("%Y-%m-%d") in active_dates:
-            days_map[curr.strftime("%A").lower()] = True
+        day_key = curr.strftime("%Y-%m-%d")
+        day_name = curr.strftime("%A").lower()
+        
+        # Determine if day is active based on connection status
+        if is_connected:
+            # Connected: meal AND (wearable_steps OR wearable_sleep)
+            has_meal = day_key in meal_dates
+            has_wearable = day_key in wearable_steps_dates or day_key in wearable_sleep_dates
+            
+            days_map[day_name] = has_meal and has_wearable
+        else:
+            # Disconnected: meal AND manual_steps AND manual_sleep (all 3 required)
+            has_all_three = (
+                day_key in meal_dates and 
+                day_key in manual_steps_dates and 
+                day_key in manual_sleep_dates
+            )
+            
+            days_map[day_name] = has_all_three
+        
         curr += timedelta(days=1)
+    
+    # Count active days (true values)
+    active_days_count = sum(1 for v in days_map.values() if v)
+    
+    logger.info(
+        f"📅 Active Days (connection={'connected' if is_connected else 'disconnected'}): "
+        f"{active_days_count} out of 7 days active"
+    )
 
     return {
         "title": "Weekly Summary",
         "date_range": date_range,
         "primary_weight_goal": goal,
         "sun_sat_overview": {
-            "description": "True indicates insight generated",
+            "description": "True indicates user activity logged",
             "days": days_map
         }
     }
@@ -1190,7 +1283,7 @@ async def build_wellness(
 
     # ---------------- Weight ----------------
     def get_latest_weight_in_range(data_obj, start_date_local, end_date_local, user_tz):
-        """Get the most recent weight entry within a specific date range"""
+        """Get the most recent weight entry WITHIN a specific date range"""
         if data_obj.get("status") != "ok" or "results" not in data_obj.get("data", {}):
             return None
         try:
@@ -1205,7 +1298,7 @@ async def build_wellness(
             start_dt = datetime.fromisoformat(start_utc.replace("Z", "+00:00"))
             end_dt = datetime.fromisoformat(end_utc.replace("Z", "+00:00"))
             
-            # Filter entries within the date range
+            # Filter entries WITHIN the date range
             valid_entries = []
             for entry in results:
                 ts = entry.get("timestamp")
@@ -1226,136 +1319,51 @@ async def build_wellness(
             logger.error(f"Error processing weight data: {e}")
             return None
 
-    def get_first_weight_in_range(data_obj, start_date_local, end_date_local, user_tz):
-        """Get the first (earliest) weight entry within a specific date range"""
-        if data_obj.get("status") != "ok" or "results" not in data_obj.get("data", {}):
-            return None
-        try:
-            results = data_obj["data"]["results"]
-            if not results:
-                return None
-            
-            # Convert date range to UTC
-            start_utc, _ = convert_local_date_to_utc_window(start_date_local, user_tz)
-            _, end_utc = convert_local_date_to_utc_window(end_date_local, user_tz)
-            
-            start_dt = datetime.fromisoformat(start_utc.replace("Z", "+00:00"))
-            end_dt = datetime.fromisoformat(end_utc.replace("Z", "+00:00"))
-            
-            # Filter entries within the date range
-            valid_entries = []
-            for entry in results:
-                ts = entry.get("timestamp")
-                if ts:
-                    try:
-                        entry_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                        if start_dt <= entry_dt < end_dt:
-                            valid_entries.append((entry_dt, float(entry.get("actual_value"))))
-                    except:
-                        continue
-            
-            if valid_entries:
-                # Get the earliest entry in this range
-                earliest = sorted(valid_entries, key=lambda x: x[0])[0]
-                return earliest[1]
-            return None
-        except Exception as e:
-            logger.error(f"Error processing weight data: {e}")
-            return None
-
-    def get_most_recent_weight(data_obj):
-        """Get the absolute most recent weight entry (for display purposes)"""
-        if data_obj.get("status") != "ok" or "results" not in data_obj.get("data", {}):
-            return None
-        try:
-            results = data_obj["data"]["results"]
-            if not results:
-                return None
-            
-            # Sort by timestamp descending to get the most recent
-            latest = sorted(
-                results,
-                key=lambda x: x.get("timestamp", ""),
-                reverse=True
-            )[0]
-            
-            return float(latest.get("actual_value"))
-        except Exception as e:
-            logger.error(f"Error processing weight data: {e}")
-            return None
-
     # Calculate previous week dates (7 days before start_date)
     start_dt = datetime.strptime(start_date_local, "%Y-%m-%d")
     prev_week_start_local = (start_dt - timedelta(days=7)).strftime("%Y-%m-%d")
     prev_week_end_local = (start_dt - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # Get latest weight from CURRENT WEEK
-    curr_week_weight = get_latest_weight_in_range(weight_data, start_date_local, end_date_local, user_tz)
+    # Get latest weight WITHIN CURRENT WEEK (Jan 4-10)
+    weight_current_week = get_latest_weight_in_range(weight_data, start_date_local, end_date_local, user_tz)
 
-    # Get latest weight from PREVIOUS WEEK
-    prev_week_weight = get_latest_weight_in_range(weight_data, prev_week_start_local, prev_week_end_local, user_tz)
+    # Get latest weight WITHIN PREVIOUS WEEK (Dec 28 - Jan 3)
+    weight_prev_week = get_latest_weight_in_range(weight_data, prev_week_start_local, prev_week_end_local, user_tz)
 
-    # Get first weight from CURRENT WEEK (for fallback comparison)
-    curr_week_first_weight = get_first_weight_in_range(weight_data, start_date_local, end_date_local, user_tz)
-
-    # Get absolute most recent weight for display
-    most_recent_weight = get_most_recent_weight(weight_data)
-
-    if most_recent_weight:
-        # Priority 1: Compare with previous week's latest weight
-        if curr_week_weight and prev_week_weight:
-            delta = round(curr_week_weight - prev_week_weight, 1)
-            positive = is_positive_change(delta, 'weight', primary_goal)
-            if delta > 0:
-                lbl = f"gained {delta}kg"
-            elif delta < 0:
-                lbl = f"lost {abs(delta)}kg"
-            else:
-                lbl = "no change"
-            logger.info(
-                f"⚖️ Weight (Priority 1): Current={most_recent_weight}kg, "
-                f"This Week Latest={curr_week_weight}kg, "
-                f"Prev Week Latest={prev_week_weight}kg, "
-                f"Delta={delta}kg"
-            )
-        # Priority 2: Compare with current week's first weight
-        elif curr_week_weight and curr_week_first_weight and curr_week_weight != curr_week_first_weight:
-            delta = round(curr_week_weight - curr_week_first_weight, 1)
-            positive = is_positive_change(delta, 'weight', primary_goal)
-            if delta > 0:
-                lbl = f"gained {delta}kg"
-            elif delta < 0:
-                lbl = f"lost {abs(delta)}kg"
-            else:
-                lbl = "no change"
-            logger.info(
-                f"⚖️ Weight (Priority 2): Current={most_recent_weight}kg, "
-                f"This Week Latest={curr_week_weight}kg, "
-                f"This Week First={curr_week_first_weight}kg, "
-                f"Delta={delta}kg"
-            )
-        # Priority 3: No comparison possible
+    # Only add weight section if we have AT LEAST 2 weight values (one from each week)
+    if weight_current_week and weight_prev_week:
+        delta = round(weight_current_week - weight_prev_week, 1)
+        positive = is_positive_change(delta, 'weight', primary_goal)
+        
+        if delta > 0:
+            lbl = f"gained {delta}kg"
+        elif delta < 0:
+            lbl = f"lost {abs(delta)}kg"
         else:
-            delta = 0
-            positive = False
             lbl = "no change"
-            logger.info(
-                f"⚖️ Weight (Priority 3): Current={most_recent_weight}kg, "
-                f"No comparison data available (change=n/a)"
-            )
         
         wellness["weight"] = {
-            "current_value": most_recent_weight,
+            "current_value": weight_current_week,
             "unit": "kg",
             "change_7d_value": delta,
             "change_7d_label": lbl,
             "positive_change": positive
         }
+        
+        logger.info(
+            f"⚖️ Weight: Current week ({start_date_local} to {end_date_local})={weight_current_week}kg, "
+            f"Prev week ({prev_week_start_local} to {prev_week_end_local})={weight_prev_week}kg, "
+            f"Delta={delta}kg"
+        )
     else:
-        logger.debug("ℹ️ No weight data found")
-
+        logger.debug(
+            f"ℹ️ Weight section omitted (need weight in both weeks): "
+            f"Current week ({start_date_local}-{end_date_local})={'✅' if weight_current_week else '❌'}, "
+            f"Prev week ({prev_week_start_local}-{prev_week_end_local})={'✅' if weight_prev_week else '❌'}"
+        )
 
     return wellness
+
 
 # ==========================================
 # API ENDPOINTS
