@@ -339,38 +339,6 @@ async def fetch_primary_goal(user_id):
         logger.error(f"❌ Error fetching primary goal: {e}, defaulting to 'Weight Loss'")
         return "Weight Loss"
 
-async def fetch_active_days(user_id, start_date_utc, end_date_utc, user_tz):
-    """
-    Fetch active days using UTC ISO timestamps, but return LOCAL date strings.
-    """
-    url = f"{API_BASE}/user-insight-messages/date-range"
-    params = {
-        "user_id": user_id,
-        "startdate": start_date_utc,
-        "enddate": end_date_utc
-    }
-    resp = await fetch_json(url, params=params)
-    active_dates = set()
-
-    if not resp: return active_dates
-    messages = resp if isinstance(resp, list) else resp.get("results", resp.get("data", []))
-
-    for msg in messages:
-        raw_ts = msg.get("message_date") # e.g., 2025-01-01T23:30:00Z
-        if raw_ts:
-            try:
-                # 1. Parse UTC
-                utc_dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
-                # 2. Convert to User TZ
-                local_dt = utc_dt.astimezone(ZoneInfo(user_tz))
-                # 3. Add Local Date
-                active_dates.add(local_dt.strftime("%Y-%m-%d"))
-            except Exception as e:
-                continue
-    
-    logger.info(f"📅 Active Days Found (Local): {len(active_dates)} ({sorted(list(active_dates))})")
-    return active_dates
-
 async def fetch_meals(user_id, start_date_utc, end_date_utc):
     url = f"{API_BASE}/meal-planner/custom-meals/foodhak-user-id/{user_id}"
     return await fetch_json(url, params={"start_date": start_date_utc, "end_date": end_date_utc})
@@ -523,36 +491,6 @@ async def build_title_card(user_id, start_date_utc, end_date_utc, goal, start_da
                     manual_sleep_dates.add(local_dt.strftime("%Y-%m-%d"))
                 except:
                     continue
-    
-    # For connected users: check if they have wearable data (steps OR sleep from provider)
-    wearable_steps_dates = set()
-    wearable_sleep_dates = set()
-    if is_connected and provider_type:
-        provider_res = await wearable_api(user_id, start_date_utc, end_date_utc, provider_type)
-        if provider_res.get("status") == "ok":
-            provider_records = provider_res.get("data", {}).get("data", []) or []
-            
-            # Extract wearable steps dates
-            steps_records = [r for r in provider_records if r.get("schema_type") == "daily"]
-            for r in steps_records:
-                meta = (r.get("data", {}) or {}).get("metadata", {}) or {}
-                start = meta.get("start_time")
-                dt = parse_dt_safe(start)
-                if dt:
-                    day_key = dt.astimezone(ZoneInfo(user_tz)).strftime("%Y-%m-%d")
-                    wearable_steps_dates.add(day_key)
-            
-            # Extract wearable sleep dates
-            sleep_records = [r for r in provider_records if r.get("schema_type") == "sleep"]
-            for r in sleep_records:
-                meta = (r.get("data", {}) or {}).get("metadata", {}) or {}
-                if not meta.get("is_nap"):
-                    start = meta.get("start_time")
-                    dt = parse_dt_safe(start)
-                    if dt:
-                        day_key = dt.astimezone(ZoneInfo(user_tz)).strftime("%Y-%m-%d")
-                        wearable_sleep_dates.add(day_key)
-    
     # Build day-by-day activity map
     days_map = {}
     curr = start_dt
@@ -562,11 +500,8 @@ async def build_title_card(user_id, start_date_utc, end_date_utc, goal, start_da
         
         # Determine if day is active based on connection status
         if is_connected:
-            # Connected: meal AND (wearable_steps OR wearable_sleep)
-            has_meal = day_key in meal_dates
-            has_wearable = day_key in wearable_steps_dates or day_key in wearable_sleep_dates
-            
-            days_map[day_name] = has_meal and has_wearable
+            # Connected: meal
+            days_map[day_name] = day_key in meal_dates
         else:
             # Disconnected: meal AND manual_steps AND manual_sleep (all 3 required)
             has_all_three = (
