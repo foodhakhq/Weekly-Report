@@ -26,7 +26,7 @@ OPENSEARCH_USER = os.getenv("OPENSEARCH_USER")
 OPENSEARCH_PWD = os.getenv("OPENSEARCH_PWD")
 VALID_API_KEY = os.getenv("VALID_API_KEY")
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
-HEALTHDATA_BEARER="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbiIsImV4cCI6MTgxNTMwMDg0MH0.TPj0mDBuk9EHFUcUaTZq8XTkKcK7Q4JfAcKUdjDGsw8"
+HEALTHDATA_BEARER = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbiIsImV4cCI6MTgxNTMwMDg0MH0.TPj0mDBuk9EHFUcUaTZq8XTkKcK7Q4JfAcKUdjDGsw8"
 # ==========================================
 # LOGGING CONFIGURATION
 # ==========================================
@@ -54,6 +54,7 @@ HEADERS = {
 OPENSEARCH_AUTH = (OPENSEARCH_USER, OPENSEARCH_PWD)
 TIMEOUT_SECONDS = 10.0
 
+
 # ==========================================
 # REQUEST/RESPONSE MODELS
 # ==========================================
@@ -63,10 +64,12 @@ class WeeklyReportRequest(BaseModel):
     start_date: str  # Format: YYYY-MM-DD (in user's local timezone)
     end_date: str  # Format: YYYY-MM-DD (in user's local timezone)
 
+
 async def _safe_get(url: str, headers: dict = None, params: dict = None):
     """Wrapper for HTTP GET requests."""
     async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
         return await client.get(url, headers=headers, params=params)
+
 
 def _parse_iso_utc(date_str: Optional[str]) -> Optional[datetime]:
     """Parses ISO string or YYYY-MM-DD to datetime object."""
@@ -79,9 +82,11 @@ def _parse_iso_utc(date_str: Optional[str]) -> Optional[datetime]:
         except:
             return None
 
+
 def _to_iso_z(dt: datetime) -> str:
     """Converts datetime to ISO string with Z suffix."""
     return dt.isoformat().replace("+00:00", "Z")
+
 
 async def _fetch_tracker(user_id: str, tracker_type: str, start_date: str, end_date: str) -> dict:
     """Fetch Internal Foodhak Tracker Data (Fallback)."""
@@ -91,7 +96,7 @@ async def _fetch_tracker(user_id: str, tracker_type: str, start_date: str, end_d
     db_type = type_map.get(tracker_type.lower(), tracker_type.upper())
     url = f"{API_BASE}/user-profile/{user_id}/tracker"
     query_string = f"type={db_type}&start_datetime={start_date}&end_datetime={end_date}"
-    
+
     try:
         resp = await _safe_get(url, headers=HEADERS, params={"query": query_string})
         if resp.status_code == 200:
@@ -101,8 +106,9 @@ async def _fetch_tracker(user_id: str, tracker_type: str, start_date: str, end_d
     except Exception as e:
         return {"status": "error", "message": str(e), "data": []}
 
+
 async def connection_status(user_id: str) -> Tuple[bool, Optional[str]]:
-    url = "https://healthdata.foodhak.com/api/v1/health/connection-status"
+    url = "https://staging-healthdata.foodhak.com/api/v1/health/connection-status"
     headers = {"accept": "application/json", "Authorization": f"Bearer {HEALTHDATA_BEARER}"}
     params = {"user_id": user_id}
 
@@ -130,6 +136,7 @@ async def connection_status(user_id: str) -> Tuple[bool, Optional[str]]:
     except Exception:
         return False, None
 
+
 def parse_dt_safe(ts: str) -> Optional[datetime]:
     if not ts:
         return None
@@ -141,6 +148,7 @@ def parse_dt_safe(ts: str) -> Optional[datetime]:
     except Exception:
         return None
 
+
 async def foodhak_sleep_steps_fallback(user_id: str, start_date: str = None, end_date: str = None) -> dict:
     """Internal Fallback Logic."""
     adj_steps_start = start_date
@@ -149,7 +157,8 @@ async def foodhak_sleep_steps_fallback(user_id: str, start_date: str = None, end
         e_dt = _parse_iso_utc(end_date)
         if s_dt and e_dt and (e_dt - s_dt) < timedelta(hours=24):
             adj_steps_start = _to_iso_z(e_dt - timedelta(hours=24))
-    except Exception: pass
+    except Exception:
+        pass
 
     sleep_res, steps_res = await asyncio.gather(
         _fetch_tracker(user_id, "sleep", adj_steps_start, end_date),
@@ -159,7 +168,7 @@ async def foodhak_sleep_steps_fallback(user_id: str, start_date: str = None, end
     errors = {}
     if sleep_res["status"] != "ok": errors["sleep"] = sleep_res["message"]
     if steps_res["status"] != "ok": errors["steps"] = steps_res["message"]
-    
+
     if len(errors) == 2:
         return {"status": "error", "source": "foodhak", "sleep": None, "steps": None, "errors": errors}
 
@@ -171,10 +180,11 @@ async def foodhak_sleep_steps_fallback(user_id: str, start_date: str = None, end
         "errors": errors or None
     }
 
+
 async def wearable_api(user_id: str, start_date: str, end_date: str, provider_type: str) -> dict:
     """Fetch from External Provider via Health Data API."""
     url = (
-        f"https://healthdata.foodhak.com/api/v1/health/health-data/{user_id}"
+        f"https://staging-healthdata.foodhak.com/api/v1/health/health-data/{user_id}"
         f"?provider_type={provider_type}&start_date={start_date}&end_date={end_date}"
     )
     headers = {"Authorization": f"Bearer {HEALTHDATA_BEARER}"}
@@ -189,6 +199,7 @@ async def wearable_api(user_id: str, start_date: str, end_date: str, provider_ty
     except Exception as e:
         return {"status": "error", "message": str(e), "source": "provider", "data": None}
 
+
 def safe_float(value):
     try:
         if value is None: return 0.0
@@ -198,11 +209,14 @@ def safe_float(value):
     except (ValueError, TypeError):
         return 0.0
 
+
 def safe_int(value):
     try:
         return int(safe_float(value))
     except (ValueError, TypeError):
         return 0
+
+
 # ==========================================
 # AUTHENTICATION
 # ==========================================
@@ -228,6 +242,7 @@ def verify_token(authorization: str = Header(None)):
         logger.error("❌ Invalid Authorization header format")
         raise HTTPException(status_code=401, detail="Invalid Authorization header format")
 
+
 # ==========================================
 # TIMEZONE CONVERSION FUNCTIONS
 # ==========================================
@@ -240,7 +255,7 @@ async def fetch_user_timezone(user_id: str) -> str:
             response = await client.get(url, headers=HEADERS)
             response.raise_for_status()
             data = response.json()
-            
+
         user_block = data.get("foodhak_user", {})
         tz = user_block.get("timezone", "UTC")
         logger.info(f"✅ Fetched timezone for user {user_id}: {tz}")
@@ -248,6 +263,7 @@ async def fetch_user_timezone(user_id: str) -> str:
     except Exception as e:
         logger.warning(f"⚠️ Failed to fetch timezone for user {user_id}, defaulting to UTC: {e}")
         return "UTC"
+
 
 def convert_local_date_to_utc_window(local_date_str: str, user_tz: str) -> tuple:
     """
@@ -259,23 +275,24 @@ def convert_local_date_to_utc_window(local_date_str: str, user_tz: str) -> tuple
     except ValueError as e:
         logger.error(f"❌ Invalid date format: {local_date_str}")
         raise ValueError(f"Date must be in YYYY-MM-DD format: {e}")
-    
+
     tz = ZoneInfo(user_tz)
-    
+
     # Create datetime at start of day in user's timezone
     local_start = datetime(local_day.year, local_day.month, local_day.day, 0, 0, 0, tzinfo=tz)
     local_end = local_start + timedelta(days=1)
-    
+
     # Convert to UTC
     start_utc = local_start.astimezone(timezone.utc)
     end_utc = local_end.astimezone(timezone.utc)
-    
+
     # Format as ISO strings with Z suffix
     start_utc_str = start_utc.isoformat().replace("+00:00", "Z")
     end_utc_str = end_utc.isoformat().replace("+00:00", "Z")
-    
+
     logger.debug(f"📅 Converted {local_date_str} ({user_tz}) -> UTC: {start_utc_str} to {end_utc_str}")
     return start_utc_str, end_utc_str
+
 
 # ==========================================
 # 2. SHARED FETCHERS (ASYNC)
@@ -288,21 +305,21 @@ async def fetch_json(url, params=None, manual_query_string=None):
 
     start_time = time.time()
     logger.debug(f"🌐 GET {full_url} | Params: {params}")
-    
+
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
             response = await client.get(full_url, headers=HEADERS, params=params)
-            
+
         duration = round((time.time() - start_time) * 1000, 2)
-        
+
         if response.status_code == 404:
             logger.warning(f"⚠️  404 Not Found: {full_url} ({duration}ms)")
             return None
-            
+
         response.raise_for_status()
         data = response.json()
         return data
-        
+
     except httpx.HTTPStatusError as e:
         logger.error(f"❌ HTTP Error {e.response.status_code} fetching {full_url}: {e}")
         return None
@@ -310,28 +327,29 @@ async def fetch_json(url, params=None, manual_query_string=None):
         logger.error(f"❌ Unexpected error fetching {full_url}: {e}")
         return None
 
+
 async def fetch_primary_goal(user_id):
     logger.info(f"🎯 Fetching primary goal for user: {user_id}")
     query = {"query": {"match": {"foodhak_user_id": user_id}}}
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
             response = await client.post(OPENSEARCH_URL, json=query, auth=OPENSEARCH_AUTH)
-            
+
         if response.status_code != 200:
             return "Weight Loss"
 
         hits = response.json().get("hits", {}).get("hits", [])
-        if not hits: 
+        if not hits:
             return "Weight Loss"
 
         source = hits[0].get("_source", {})
         goals = source.get("user_health_goals", [])
 
         primary = next((g for g in goals if g.get("user_goal", {}).get("is_primary")), None)
-        if primary: 
+        if primary:
             return primary["user_goal"].get("title")
-        
-        if goals: 
+
+        if goals:
             return goals[0]["user_goal"].get("title")
 
         return "Weight Loss"
@@ -339,19 +357,22 @@ async def fetch_primary_goal(user_id):
         logger.error(f"❌ Error fetching primary goal: {e}, defaulting to 'Weight Loss'")
         return "Weight Loss"
 
+
 async def fetch_meals(user_id, start_date_utc, end_date_utc):
     url = f"{API_BASE}/meal-planner/custom-meals/foodhak-user-id/{user_id}"
     return await fetch_json(url, params={"start_date": start_date_utc, "end_date": end_date_utc})
 
+
 async def fetch_daily_target(user_id):
     url = f"{API_BASE}/user-healthprofile-group-details/{user_id}/nutrient-guidelines"
     data = await fetch_json(url)
-    if not data or "results" not in data: 
+    if not data or "results" not in data:
         return 2000
     energy = data["results"].get("Energy", [])
-    if energy: 
+    if energy:
         return safe_int(energy[0].get("target_value", 2000))
     return 2000
+
 
 async def fetch_chats(user_id, start_date_utc, end_date_utc):
     url = f"{API_BASE}/chathistory/latest-sessions/"
@@ -359,7 +380,7 @@ async def fetch_chats(user_id, start_date_utc, end_date_utc):
     if not resp: return []
 
     valid_chats = []
-    
+
     # Parse timestamps for comparison
     s_dt = datetime.fromisoformat(start_date_utc.replace("Z", "+00:00"))
     e_dt = datetime.fromisoformat(end_date_utc.replace("Z", "+00:00"))
@@ -377,20 +398,22 @@ async def fetch_chats(user_id, start_date_utc, end_date_utc):
                         if content: valid_chats.append(content)
         except:
             continue
-    
+
     return valid_chats
+
 
 async def fetch_trackers(user_id, start_date_utc, end_date_utc):
     base_url = f"{API_BASE}/user-profile/{user_id}/tracker"
     types = ["WEIGHT", "STEPS", "SLEEP", "MOOD_ENTRY"]
     data = {}
-    
+
     for t in types:
         query_string = f"type={t}&start_datetime={start_date_utc}&end_datetime={end_date_utc}"
         params = {"query": query_string}
         resp = await fetch_json(base_url, params=params)
         data[t] = resp.get("results", resp.get("data", [])) if resp else []
     return data
+
 
 async def fetch_scans(user_id, start_date_utc, end_date_utc):
     url = f"{API_BASE}/scans/by-user/"
@@ -399,6 +422,7 @@ async def fetch_scans(user_id, start_date_utc, end_date_utc):
     if isinstance(resp, list): return resp
     if isinstance(resp, dict): return resp.get("results", [])
     return []
+
 
 # ==========================================
 # 3. HELPER: CLEAN LLM JSON
@@ -415,6 +439,7 @@ def extract_json_from_llm_response(text):
     except:
         return text
 
+
 # ==========================================
 # 4. GOAL-AWARE LOGIC
 # ==========================================
@@ -428,10 +453,15 @@ def is_positive_change(delta, metric_type, goal):
     if delta == 0:
         return True if is_maintain_goal else False
 
-    if is_loss_goal: return delta < 0
-    elif is_gain_goal: return delta > 0
-    elif is_maintain_goal: return False
-    else: return delta == 0
+    if is_loss_goal:
+        return delta < 0
+    elif is_gain_goal:
+        return delta > 0
+    elif is_maintain_goal:
+        return False
+    else:
+        return delta == 0
+
 
 # ==========================================
 # 5. SECTION PROCESSORS (ASYNC)
@@ -439,7 +469,7 @@ def is_positive_change(delta, metric_type, goal):
 
 async def build_title_card(user_id, start_date_utc, end_date_utc, goal, start_date_local, end_date_local, user_tz):
     logger.info("Building Title Card...")
-    
+
     start_dt = datetime.strptime(start_date_local, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date_local, "%Y-%m-%d")
 
@@ -450,14 +480,14 @@ async def build_title_card(user_id, start_date_utc, end_date_utc, goal, start_da
 
     # Check connection status
     is_connected, provider_type = await connection_status(user_id)
-    
+
     # Fetch data in parallel
     meals_data, manual_steps_data, manual_sleep_data = await asyncio.gather(
         fetch_meals(user_id, start_date_utc, end_date_utc),
         _fetch_tracker(user_id, "steps", start_date_utc, end_date_utc),
         _fetch_tracker(user_id, "sleep", start_date_utc, end_date_utc)
     )
-    
+
     # Extract meal dates (convert UTC to local)
     meal_dates = set()
     if meals_data and "results" in meals_data:
@@ -470,7 +500,7 @@ async def build_title_card(user_id, start_date_utc, end_date_utc, goal, start_da
                     meal_dates.add(local_dt.strftime("%Y-%m-%d"))
                 except:
                     continue
-    
+
     # Extract manual steps dates
     manual_steps_dates = set()
     if manual_steps_data.get("status") == "ok":
@@ -478,7 +508,7 @@ async def build_title_card(user_id, start_date_utc, end_date_utc, goal, start_da
             date_str = item.get("date")
             if date_str:
                 manual_steps_dates.add(date_str)
-    
+
     # Extract manual sleep dates (convert UTC to local)
     manual_sleep_dates = set()
     if manual_sleep_data.get("status") == "ok":
@@ -497,7 +527,7 @@ async def build_title_card(user_id, start_date_utc, end_date_utc, goal, start_da
     while curr <= end_dt:
         day_key = curr.strftime("%Y-%m-%d")
         day_name = curr.strftime("%A").lower()
-        
+
         # Determine if day is active based on connection status
         if is_connected:
             # Connected: meal
@@ -505,18 +535,18 @@ async def build_title_card(user_id, start_date_utc, end_date_utc, goal, start_da
         else:
             # Disconnected: meal AND manual_steps AND manual_sleep (all 3 required)
             has_all_three = (
-                day_key in meal_dates and 
-                day_key in manual_steps_dates and 
-                day_key in manual_sleep_dates
+                    day_key in meal_dates and
+                    day_key in manual_steps_dates and
+                    day_key in manual_sleep_dates
             )
-            
+
             days_map[day_name] = has_all_three
-        
+
         curr += timedelta(days=1)
-    
+
     # Count active days (true values)
     active_days_count = sum(1 for v in days_map.values() if v)
-    
+
     logger.info(
         f"📅 Active Days (connection={'connected' if is_connected else 'disconnected'}): "
         f"{active_days_count} out of 7 days active"
@@ -532,18 +562,20 @@ async def build_title_card(user_id, start_date_utc, end_date_utc, goal, start_da
         }
     }
 
-async def build_nutrition(user_id, start_date_utc, end_date_utc, primary_goal, start_date_local, end_date_local, user_tz):
+
+async def build_nutrition(user_id, start_date_utc, end_date_utc, primary_goal, start_date_local, end_date_local,
+                          user_tz):
     logger.info(f"Building Nutrition Section (Goal: {primary_goal})")
-    
+
     # Calculate previous week dates in local timezone
     dt_curr = datetime.strptime(start_date_local, "%Y-%m-%d")
     prev_start_local = (dt_curr - timedelta(days=7)).strftime("%Y-%m-%d")
     prev_end_local = (dt_curr - timedelta(days=1)).strftime("%Y-%m-%d")
-    
+
     # Convert previous week to UTC
     prev_start_utc, _ = convert_local_date_to_utc_window(prev_start_local, user_tz)
     _, prev_end_utc = convert_local_date_to_utc_window(prev_end_local, user_tz)
-    
+
     logger.info("⚡ Parallel Fetch: Current Meals, Previous Meals, Target")
     curr_data, prev_data, target = await asyncio.gather(
         fetch_meals(user_id, start_date_utc, end_date_utc),
@@ -552,14 +584,14 @@ async def build_nutrition(user_id, start_date_utc, end_date_utc, primary_goal, s
     )
 
     # -----------------------------------------------------
-    #Analyze Function now converts UTC -> Local
+    # Analyze Function now converts UTC -> Local
     # -----------------------------------------------------
     def analyze(data, range_start_str, range_end_str, timezone_str, label=""):
         daily_map = defaultdict(lambda: {"p": 0.0, "c": 0.0, "f": 0.0, "k": 0.0})
-        
+
         if data and "results" in data:
             for item in data["results"]:
-                ts = item.get("timestamp") # UTC Timestamp from DB
+                ts = item.get("timestamp")  # UTC Timestamp from DB
                 if ts:
                     try:
                         # 1. Parse UTC
@@ -579,7 +611,7 @@ async def build_nutrition(user_id, start_date_utc, end_date_utc, primary_goal, s
         totals = {"p": 0, "c": 0, "f": 0, "k": 0}
         logged_count = len(daily_map)
         daily_stats = []
-        
+
         curr_d = datetime.strptime(range_start_str, "%Y-%m-%d")
         end_d = datetime.strptime(range_end_str, "%Y-%m-%d")
 
@@ -590,22 +622,24 @@ async def build_nutrition(user_id, start_date_utc, end_date_utc, primary_goal, s
             if d_str in daily_map:
                 stats = daily_map[d_str]
                 eaten = safe_int(stats["k"])
-                
-                totals["p"] += stats["p"]; totals["c"] += stats["c"]
-                totals["f"] += stats["f"]; totals["k"] += stats["k"]
-                
+
+                totals["p"] += stats["p"];
+                totals["c"] += stats["c"]
+                totals["f"] += stats["f"];
+                totals["k"] += stats["k"]
+
                 exact_protein_g = stats["p"]
                 exact_carbs_g = stats["c"]
                 exact_fats_g = stats["f"]
                 total_grams = exact_protein_g + exact_carbs_g + exact_fats_g
-                
+
                 if total_grams > 0:
                     protein_pct = round((exact_protein_g / total_grams) * 100, 1)
                     carbs_pct = round((exact_carbs_g / total_grams) * 100, 1)
                     fats_pct = round(100.0 - protein_pct - carbs_pct, 1)
                 else:
                     protein_pct = carbs_pct = fats_pct = 0.0
-                
+
                 daily_stats.append({
                     "day": day_name,
                     "is_logged": True,
@@ -630,25 +664,25 @@ async def build_nutrition(user_id, start_date_utc, end_date_utc, primary_goal, s
             curr_d += timedelta(days=1)
 
         if logged_count > 0:
-            avgs = {k: safe_int(v/logged_count) for k, v in totals.items()}
+            avgs = {k: safe_int(v / logged_count) for k, v in totals.items()}
         else:
             avgs = {"p": 0, "c": 0, "f": 0, "k": 0}
-            
+
         logger.debug(f"ℹ️ {label} Analysis: {logged_count} days logged out of {len(daily_stats)} total days")
         return {"avgs": avgs, "days": daily_stats, "count": logged_count}
 
     # Pass user_tz to the analyzer
     curr_res = analyze(curr_data, start_date_local, end_date_local, user_tz, "CURRENT WEEK")
     prev_res = analyze(prev_data, prev_start_local, prev_end_local, user_tz, "PREVIOUS WEEK")
-    
-    if not curr_res: 
+
+    if not curr_res:
         logger.warning("⚠️ Unexpected error in nutrition analysis")
         return None
-    
+
     prev_day_count = prev_res["count"] if prev_res else 0
     show_deltas = prev_day_count >= 1
     avg_curr = curr_res["avgs"]
-    
+
     if show_deltas:
         avg_prev = prev_res["avgs"]
         deltas = {
@@ -666,30 +700,36 @@ async def build_nutrition(user_id, start_date_utc, end_date_utc, primary_goal, s
     carbs_kcal = avg_curr["c"] * 4
     fat_kcal = avg_curr["f"] * 9
     total_macro_kcal = protein_kcal + carbs_kcal + fat_kcal
-    
+
     if total_macro_kcal > 0:
         pct_p = round((protein_kcal / total_macro_kcal) * 100)
         pct_c = round((carbs_kcal / total_macro_kcal) * 100)
         pct_f = round((fat_kcal / total_macro_kcal) * 100)
     else:
         pct_p = pct_c = pct_f = 0
-    
+
     goal_lower = primary_goal.lower()
     is_loss_goal = "loss" in goal_lower or "lose" in goal_lower
     is_gain_goal = "gain" in goal_lower
-    
+
     if is_loss_goal:
-        protein_threshold = 30; carbs_threshold = 50; fat_threshold = 35
+        protein_threshold = 30;
+        carbs_threshold = 50;
+        fat_threshold = 35
         balanced_ranges = {"p": (25, 30), "c": (40, 50), "f": (20, 30)}
     elif is_gain_goal:
-        protein_threshold = 25; carbs_threshold = 60; fat_threshold = 35
+        protein_threshold = 25;
+        carbs_threshold = 60;
+        fat_threshold = 35
         balanced_ranges = {"p": (20, 25), "c": (50, 60), "f": (25, 35)}
     else:  # Maintenance
-        protein_threshold = 25; carbs_threshold = 55; fat_threshold = 35
+        protein_threshold = 25;
+        carbs_threshold = 55;
+        fat_threshold = 35
         balanced_ranges = {"p": (20, 25), "c": (45, 55), "f": (20, 30)}
-    
+
     persona = None
-    persona_title = "Balanced" 
+    persona_title = "Balanced"
 
     if pct_f >= fat_threshold:
         persona_title = "Fat-heavy week"
@@ -726,7 +766,7 @@ async def build_nutrition(user_id, start_date_utc, end_date_utc, primary_goal, s
             "visual_data": {"protein_pct": pct_p, "carbs_pct": pct_c, "fats_pct": pct_f},
             "logic_rule_applied": f"P {p_min}-{p_max}% | C {c_min}-{c_max}% | F {f_min}-{f_max}%"
         }
-    
+
     response = {
         "summary": {
             "avg_daily_kcal": avg_curr["k"],
@@ -746,11 +786,13 @@ async def build_nutrition(user_id, start_date_utc, end_date_utc, primary_goal, s
             "kcal_delta_7d": deltas["k"],
             "kcal_positive_change": kcal_positive
         })
-        response["macro_averages_7d"]["protein"].update({"delta_grams": deltas["p"], "positive_change": protein_positive})
+        response["macro_averages_7d"]["protein"].update(
+            {"delta_grams": deltas["p"], "positive_change": protein_positive})
         response["macro_averages_7d"]["carbs"].update({"delta_grams": deltas["c"], "positive_change": carbs_positive})
         response["macro_averages_7d"]["fats"].update({"delta_grams": deltas["f"], "positive_change": fats_positive})
 
     return response
+
 
 async def build_faye(user_id, start_date_utc, end_date_utc):
     logger.info("🏗️ Building Faye Insights...")
@@ -792,6 +834,7 @@ async def build_faye(user_id, start_date_utc, end_date_utc):
         logger.error(f"❌ Error generating Faye insights: {e}")
         return None
 
+
 def bucket_tracker_by_local_day(records: List[dict], user_tz: str, value_key: str, deduplicate: bool = False):
     """
     Buckets tracker records by local YYYY-MM-DD.
@@ -800,12 +843,12 @@ def bucket_tracker_by_local_day(records: List[dict], user_tz: str, value_key: st
     if deduplicate:
         # For sleep/weight: keep only the latest timestamp per day
         day_entries = defaultdict(list)
-        
+
         for r in records or []:
             ts = r.get("timestamp") or r.get("date")
             if not ts:
                 continue
-            
+
             try:
                 utc_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                 local_dt = utc_dt.astimezone(ZoneInfo(user_tz))
@@ -813,19 +856,19 @@ def bucket_tracker_by_local_day(records: List[dict], user_tz: str, value_key: st
                 day_entries[day_key].append((utc_dt, safe_float(r.get(value_key, 0))))
             except Exception:
                 continue
-        
+
         # Keep only the latest entry per day
         buckets = {}
         for day_key, entries in day_entries.items():
             # Sort by timestamp and take the last one
             latest_entry = sorted(entries, key=lambda x: x[0])[-1]
             buckets[day_key] = latest_entry[1]
-        
+
         return buckets
     else:
         # For steps: sum all values per day
         buckets = defaultdict(float)
-        
+
         for r in records or []:
             ts = r.get("timestamp") or r.get("date")
             if not ts:
@@ -840,6 +883,7 @@ def bucket_tracker_by_local_day(records: List[dict], user_tz: str, value_key: st
                 continue
 
         return buckets
+
 
 def bucket_provider_steps(records, user_tz):
     buckets = defaultdict(int)
@@ -888,6 +932,7 @@ def bucket_provider_sleep(records, user_tz: str):
 
     return buckets
 
+
 async def fetch_weight_direct(user_id: str) -> dict:
     """
     Fetches weight from the specific /trackers/foodhak-user/ endpoint.
@@ -903,15 +948,16 @@ async def fetch_weight_direct(user_id: str) -> dict:
     except Exception as e:
         logger.error(f"❌ Error fetching weight direct: {e}")
         return {"status": "error", "message": str(e), "data": {}}
-    
+
+
 async def build_wellness(
-    user_id: str,
-    start_date_utc: str,
-    end_date_utc: str,
-    primary_goal: str,
-    start_date_local: str,
-    end_date_local: str,
-    user_tz: str,
+        user_id: str,
+        start_date_utc: str,
+        end_date_utc: str,
+        primary_goal: str,
+        start_date_local: str,
+        end_date_local: str,
+        user_tz: str,
 ):
     """
     Robust weekly wellness:
@@ -1022,7 +1068,7 @@ async def build_wellness(
         fallback_steps_by_day[d] += int(r.get("total_steps", 0))
 
     # -------- Fallback sleep: bucket by local day of timestamp --------
-    fallback_sleep_timestamps = {}  
+    fallback_sleep_timestamps = {}
 
     for r in fb_sleep_records:
         ts = r.get("timestamp")
@@ -1030,9 +1076,10 @@ async def build_wellness(
         if not dt:
             continue
         day_key = dt.astimezone(tz).strftime("%Y-%m-%d")
-        
+
         # Keep only the latest entry per day
-        if day_key not in fallback_sleep_by_day or dt > fallback_sleep_timestamps.get(day_key, datetime.min.replace(tzinfo=timezone.utc)):
+        if day_key not in fallback_sleep_by_day or dt > fallback_sleep_timestamps.get(day_key, datetime.min.replace(
+                tzinfo=timezone.utc)):
             fallback_sleep_present[day_key] = True
             fallback_sleep_by_day[day_key] = float(r.get("actual_value", 0))
             fallback_sleep_timestamps[day_key] = dt
@@ -1058,15 +1105,14 @@ async def build_wellness(
             steps_source_by_day[day_key] = "foodhak"
         else:
             steps_source_by_day[day_key] = "none"
-        
-        #precedance change
+
+        # precedance change
         # if fallback_steps_present.get(day_key):
         #     steps_by_day[day_key] = fallback_steps_by_day.get(day_key, 0)
         #     steps_source_by_day[day_key] = "foodhak"
         # elif provider_steps_present.get(day_key):
         #     steps_by_day[day_key] = provider_steps_by_day.get(day_key, 0)
         #     steps_source_by_day[day_key] = "provider"
-
 
         # Sleep: provider if record present, else fallback if present
         if provider_sleep_present.get(day_key):
@@ -1078,14 +1124,13 @@ async def build_wellness(
         else:
             sleep_source_by_day[day_key] = "none"
 
-        #precedance change
+        # precedance change
         # if fallback_sleep_present.get(day_key):
         #     sleep_by_day[day_key] = fallback_sleep_by_day.get(day_key, 0)
         #     sleep_source_by_day[day_key] = "foodhak"
         # elif provider_sleep_present.get(day_key):
         #     sleep_by_day[day_key] = provider_sleep_by_day.get(day_key, 0)
         #     sleep_source_by_day[day_key] = "provider"
-
 
         curr += timedelta(days=1)
 
@@ -1096,8 +1141,10 @@ async def build_wellness(
     fallback_steps_days = len([d for d, p in fallback_steps_present.items() if p])
     provider_sleep_days = len([d for d, p in provider_sleep_present.items() if p])
     fallback_sleep_days = len([d for d, p in fallback_sleep_present.items() if p])
-    resolved_steps_days = len([d for d, v in steps_by_day.items() if v is not None and steps_source_by_day.get(d) != "none"])
-    resolved_sleep_days = len([d for d, v in sleep_by_day.items() if v is not None and sleep_source_by_day.get(d) != "none"])
+    resolved_steps_days = len(
+        [d for d, v in steps_by_day.items() if v is not None and steps_source_by_day.get(d) != "none"])
+    resolved_sleep_days = len(
+        [d for d, v in sleep_by_day.items() if v is not None and sleep_source_by_day.get(d) != "none"])
 
     logger.info(
         f"🩺 Wellness merge | provider_type={provider_type} | "
@@ -1150,9 +1197,9 @@ async def build_wellness(
             for m in (mood_data.get("data") or [])
             if m.get("actual_value")
         ]
-        
+
         unique_moods = len(set(vals))
-        
+
         # Need at least 2 different mood types for mood mix
         if unique_moods >= 2:
             counts = Counter(vals).most_common(3)
@@ -1172,11 +1219,11 @@ async def build_wellness(
                 "APATHETIC": "😐",
                 "CUSTOM": "😶"
             }
-            
+
             # Randomize only if exactly 2 moods AND they have the same count (tie)
             if len(counts) == 2 and counts[0][1] == counts[1][1]:
                 random.shuffle(counts)
-            
+
             for i, (mood_name, count) in enumerate(counts):
                 clusters.append({
                     "mood_name": mood_name,
@@ -1184,7 +1231,7 @@ async def build_wellness(
                     "count": count,
                     "visual_size": sizes[i] if i < 3 else "Small"
                 })
-            
+
             wellness["mood_mix"] = {"status": "active", "clusters": clusters}
             logger.info(f"😊 Mood Mix created: {len(clusters)} clusters (unique_moods={unique_moods})")
         else:
@@ -1198,13 +1245,15 @@ async def build_wellness(
         for s in scans:
             name = s.get("name", "Unknown Item")
             try:
-                score = float(s.get("foodhak_score", {}).get("Score", 0) if isinstance(s.get("foodhak_score"), dict) else s.get("foodhak_score", 0))
+                score = float(
+                    s.get("foodhak_score", {}).get("Score", 0) if isinstance(s.get("foodhak_score"), dict) else s.get(
+                        "foodhak_score", 0))
                 score = round(score, 1)
             except:
                 score = 0.0
             image_url = s.get("image_url") or s.get("image") or s.get("product_image") or s.get("img_url") or None
             scan_item = {"product_name": name, "score": score}
-            if image_url: 
+            if image_url:
                 scan_item["image_url"] = image_url
             processed.append(scan_item)
         processed.sort(key=lambda x: x["score"], reverse=True)
@@ -1225,14 +1274,14 @@ async def build_wellness(
             results = data_obj["data"]["results"]
             if not results:
                 return None
-            
+
             # Convert date range to UTC
             start_utc, _ = convert_local_date_to_utc_window(start_date_local, user_tz)
             _, end_utc = convert_local_date_to_utc_window(end_date_local, user_tz)
-            
+
             start_dt = datetime.fromisoformat(start_utc.replace("Z", "+00:00"))
             end_dt = datetime.fromisoformat(end_utc.replace("Z", "+00:00"))
-            
+
             # Filter entries WITHIN the date range
             valid_entries = []
             for entry in results:
@@ -1244,7 +1293,7 @@ async def build_wellness(
                             valid_entries.append((entry_dt, float(entry.get("actual_value"))))
                     except:
                         continue
-            
+
             if valid_entries:
                 # Get the most recent entry in this range
                 latest = sorted(valid_entries, key=lambda x: x[0], reverse=True)[0]
@@ -1269,14 +1318,14 @@ async def build_wellness(
     if weight_current_week and weight_prev_week:
         delta = round(weight_current_week - weight_prev_week, 1)
         positive = is_positive_change(delta, 'weight', primary_goal)
-        
+
         if delta > 0:
             lbl = f"gained {delta}kg"
         elif delta < 0:
             lbl = f"lost {abs(delta)}kg"
         else:
             lbl = "no change"
-        
+
         wellness["weight"] = {
             "current_value": weight_current_week,
             "unit": "kg",
@@ -1284,7 +1333,7 @@ async def build_wellness(
             "change_7d_label": lbl,
             "positive_change": positive
         }
-        
+
         logger.info(
             f"⚖️ Weight: Current week ({start_date_local} to {end_date_local})={weight_current_week}kg, "
             f"Prev week ({prev_week_start_local} to {prev_week_end_local})={weight_prev_week}kg, "
@@ -1313,7 +1362,7 @@ async def generate_weekly_report(
     logger.info("=" * 80)
     logger.info(f"🚀 NEW WEEKLY REPORT REQUEST: {request.user_id}")
     logger.info(f"📅 Local Date Range: {request.start_date} to {request.end_date}")
-    
+
     try:
         try:
             datetime.strptime(request.start_date, "%Y-%m-%d")
@@ -1326,23 +1375,23 @@ async def generate_weekly_report(
             fetch_user_timezone(request.user_id),
             fetch_primary_goal(request.user_id)
         )
-        
+
         # Step 2: Convert local dates to UTC windows
         start_date_utc_begin, _ = convert_local_date_to_utc_window(request.start_date, user_tz)
         _, end_date_utc_end = convert_local_date_to_utc_window(request.end_date, user_tz)
-        
+
         # Step 3: Parallel Build
         logger.info("⚡ STARTING PARALLEL SECTION BUILD...")
         title_res, nutrition_res, faye_res, wellness_res = await asyncio.gather(
-            build_title_card(request.user_id, start_date_utc_begin, end_date_utc_end, primary_goal, 
-                           request.start_date, request.end_date, user_tz),
+            build_title_card(request.user_id, start_date_utc_begin, end_date_utc_end, primary_goal,
+                             request.start_date, request.end_date, user_tz),
             build_nutrition(request.user_id, start_date_utc_begin, end_date_utc_end, primary_goal,
-                          request.start_date, request.end_date, user_tz),
+                            request.start_date, request.end_date, user_tz),
             build_faye(request.user_id, start_date_utc_begin, end_date_utc_end),
             build_wellness(request.user_id, start_date_utc_begin, end_date_utc_end, primary_goal,
-                         request.start_date, request.end_date, user_tz)
+                           request.start_date, request.end_date, user_tz)
         )
-        
+
         final_report = {}
         if title_res: final_report["title_card"] = title_res
         if nutrition_res: final_report["nutrition"] = nutrition_res
@@ -1350,14 +1399,14 @@ async def generate_weekly_report(
         if wellness_res: final_report.update(wellness_res)
 
         # Step 4: Post to External
-        external_api_url = "https://api.foodhak.com/weekly-reports/create/"
+        external_api_url = "https://api-staging.foodhak.com/weekly-reports/create/"
         payload = {
             "user": request.user_id,
-            "week_start": request.start_date, # Sending LOCAL date as requested
-            "week_end": request.end_date,     # Sending LOCAL date as requested
+            "week_start": request.start_date,  # Sending LOCAL date as requested
+            "week_end": request.end_date,  # Sending LOCAL date as requested
             "report_json": final_report
         }
-        
+
         logger.info(f"📤 Posting report to External API...")
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1366,7 +1415,7 @@ async def generate_weekly_report(
                     json=payload,
                     headers=HEADERS
                 )
-            
+
             if external_response.status_code in [200, 201]:
                 logger.info("✅ SUCCESS: Report posted to external API")
                 return JSONResponse(status_code=200, content=final_report)
@@ -1398,14 +1447,18 @@ async def generate_weekly_report(
         logger.error(f"❌ CRITICAL SERVER ERROR: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
+
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "Weekly Reports API"}
+
 
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
 
+
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
