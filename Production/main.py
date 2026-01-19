@@ -108,7 +108,7 @@ async def _fetch_tracker(user_id: str, tracker_type: str, start_date: str, end_d
 
 
 async def connection_status(user_id: str) -> Tuple[bool, Optional[str]]:
-    url = "https://staging-healthdata.foodhak.com/api/v1/health/connection-status"
+    url = "https://healthdata.foodhak.com/api/v1/health/connection-status"
     headers = {"accept": "application/json", "Authorization": f"Bearer {HEALTHDATA_BEARER}"}
     params = {"user_id": user_id}
 
@@ -184,7 +184,7 @@ async def foodhak_sleep_steps_fallback(user_id: str, start_date: str = None, end
 async def wearable_api(user_id: str, start_date: str, end_date: str, provider_type: str) -> dict:
     """Fetch from External Provider via Health Data API."""
     url = (
-        f"https://staging-healthdata.foodhak.com/api/v1/health/health-data/{user_id}"
+        f"https://healthdata.foodhak.com/api/v1/health/health-data/{user_id}"
         f"?provider_type={provider_type}&start_date={start_date}&end_date={end_date}"
     )
     headers = {"Authorization": f"Bearer {HEALTHDATA_BEARER}"}
@@ -1399,7 +1399,7 @@ async def generate_weekly_report(
         if wellness_res: final_report.update(wellness_res)
 
         # Step 4: Post to External
-        external_api_url = "https://api-staging.foodhak.com/weekly-reports/create/"
+        external_api_url = "https://api.foodhak.com/weekly-reports/create/"
         payload = {
             "user": request.user_id,
             "week_start": request.start_date,  # Sending LOCAL date as requested
