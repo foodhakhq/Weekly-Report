@@ -825,7 +825,7 @@ async def build_faye(user_id, start_date_utc, end_date_utc):
     try:
         logger.info("🤖 Calling Claude API...")
         msg = await client.messages.create(
-            model="claude-sonnet-4-5-20250929",
+            model="claude-sonnet-4-6",
             max_tokens=1024, temperature=0, messages=[{"role": "user", "content": prompt}]
         )
         result = json.loads(extract_json_from_llm_response(msg.content[0].text))
