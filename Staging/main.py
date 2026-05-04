@@ -21,10 +21,8 @@ from zoneinfo import ZoneInfo
 load_dotenv()
 
 API_BASE = os.getenv("API_BASE")
-OPENSEARCH_URL = os.getenv("OPENSEARCH_URL")
-OPENSEARCH_USER = os.getenv("OPENSEARCH_USER")
-OPENSEARCH_PWD = os.getenv("OPENSEARCH_PWD")
 VALID_API_KEY = os.getenv("VALID_API_KEY")
+FOODHAK_CSRF_TOKEN = os.getenv("FOODHAK_CSRF_TOKEN")
 CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY")
 HEALTHDATA_BEARER = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbiIsImV4cCI6MTgxNTMwMDg0MH0.TPj0mDBuk9EHFUcUaTZq8XTkKcK7Q4JfAcKUdjDGsw8"
 # ==========================================
@@ -50,9 +48,12 @@ HEADERS = {
     "Authorization": f"Api-Key {VALID_API_KEY}",
     "accept": "application/json",
 }
+if FOODHAK_CSRF_TOKEN:
+    HEADERS["X-CSRFToken"] = FOODHAK_CSRF_TOKEN
 
-OPENSEARCH_AUTH = (OPENSEARCH_USER, OPENSEARCH_PWD)
 TIMEOUT_SECONDS = 10.0
+# Shared catalog from GET /health-concerns/goals/ (same for every user); not per-user state.
+_goals_catalog_cache: Optional[List[Dict[str, Any]]] = None
 
 
 # ==========================================
@@ -328,34 +329,52 @@ async def fetch_json(url, params=None, manual_query_string=None):
         return None
 
 
-async def fetch_primary_goal(user_id):
+async def _fetch_goals_catalog() -> List[Dict[str, Any]]:
+    """GET /health-concerns/goals/ — cached for process lifetime."""
+    global _goals_catalog_cache
+    if _goals_catalog_cache is not None:
+        return _goals_catalog_cache
+    url = f"{API_BASE}/health-concerns/goals/"
+    data = await fetch_json(url)
+    if isinstance(data, list):
+        _goals_catalog_cache = data
+        return data
+    return []
+
+
+async def fetch_primary_goal(user_id: str) -> str:
+    """Resolve primary goal title via health-concerns APIs (replaces OpenSearch)."""
     logger.info(f"🎯 Fetching primary goal for user: {user_id}")
-    query = {"query": {"match": {"foodhak_user_id": user_id}}}
+    # Fallback when API errors, no goals row, or unknown goal UUID (aligned with former OpenSearch default).
+    default_goal = "Weight Loss"
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
-            response = await client.post(OPENSEARCH_URL, json=query, auth=OPENSEARCH_AUTH)
+        user_url = f"{API_BASE}/health-concerns/foodhak-user/{user_id}/goals"
+        user_data = await fetch_json(user_url)
+        if not user_data or not isinstance(user_data.get("results"), list):
+            return default_goal
 
-        if response.status_code != 200:
-            return "Weight Loss"
+        rows = user_data["results"]
+        if not rows:
+            return default_goal
 
-        hits = response.json().get("hits", {}).get("hits", [])
-        if not hits:
-            return "Weight Loss"
+        primary_row = next((r for r in rows if r.get("is_primary")), None)
+        if not primary_row:
+            primary_row = rows[0]
 
-        source = hits[0].get("_source", {})
-        goals = source.get("user_health_goals", [])
+        goal_uuid = primary_row.get("goal")
+        if not goal_uuid:
+            return default_goal
 
-        primary = next((g for g in goals if g.get("user_goal", {}).get("is_primary")), None)
-        if primary:
-            return primary["user_goal"].get("title")
-
-        if goals:
-            return goals[0]["user_goal"].get("title")
-
-        return "Weight Loss"
+        catalog = await _fetch_goals_catalog()
+        for g in catalog:
+            if g.get("id") == goal_uuid:
+                title = g.get("title")
+                if title:
+                    return str(title).strip() or default_goal
+        return default_goal
     except Exception as e:
-        logger.error(f"❌ Error fetching primary goal: {e}, defaulting to 'Weight Loss'")
-        return "Weight Loss"
+        logger.error(f"❌ Error fetching primary goal: {e}, defaulting to '{default_goal}'")
+        return default_goal
 
 
 async def fetch_meals(user_id, start_date_utc, end_date_utc):
