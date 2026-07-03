@@ -55,6 +55,7 @@ TIMEOUT_SECONDS = 10.0
 # Shared catalog from GET /health-concerns/goals/ (same for every user); not per-user state.
 _goals_catalog_cache: Optional[List[Dict[str, Any]]] = None
 
+
 # ==========================================
 # REQUEST/RESPONSE MODELS
 # ==========================================
