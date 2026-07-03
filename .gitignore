@@ -1,0 +1,38 @@
+
+# Weekly-Report env files
+Production/.env
+Production/.env.*
+Staging/.env
+Staging/.env.*
+
+# Weekly-Report virtual environments
+Production/venv/
+Production/.venv/
+Production/env/
+Production/ENV/
+Staging/venv/
+Staging/.venv/
+Staging/env/
+Staging/ENV/
+
+# If venv is created directly inside Production/Staging
+Production/lib/python*/
+Production/site-packages/
+Production/bin/activate
+Production/pyvenv.cfg
+Staging/lib/python*/
+Staging/site-packages/
+Staging/bin/activate
+Staging/pyvenv.cfg
+
+# Python cache
+Production/__pycache__/
+Production/**/__pycache__/
+Staging/__pycache__/
+Staging/**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# System files
+.DS_Store
